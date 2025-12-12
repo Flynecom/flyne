@@ -1281,7 +1281,7 @@ echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━
 echo ""
 echo -e "${BLUE}Structure:${NC}"
 echo -e "  ${FLYNE_DIR}/"
-echo -e "  ├── index.php      ${YELLOW}← Upload this next!${NC}"
+echo -e "  ├── index.php      ✓ Downloaded"
 echo -e "  ├── flyne.conf     ✓ Created"
 echo -e "  ├── scripts/       ✓ Created"
 echo -e "  │   ├── php-switch.sh"
@@ -1304,7 +1304,8 @@ echo -e "  Redis Memory:   ${REDIS_MEM}MB"
 echo -e "  CPU Cores:      ${CPU_CORES}"
 echo ""
 echo -e "${BLUE}Next Steps:${NC}"
-echo -e "  1. Upload ${YELLOW}index.php${NC} to ${FLYNE_DIR}/"
+echo -e "  1. Test the API:"
+echo -e "     ${CYAN}flyne test${NC}"
 echo -e "  2. Create your first site:"
 echo -e "     ${CYAN}flyne create example.com${NC}"
 echo ""
@@ -1312,6 +1313,18 @@ echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━�
 echo -e "${RED}   SAVE THESE CREDENTIALS SECURELY!${NC}"
 echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
+
+# Download index.php automatically
+log "Downloading API file..."
+wget -qO ${FLYNE_DIR}/index.php https://raw.githubusercontent.com/Flynecom/flyne/main/index.php
+chown www-data:www-data ${FLYNE_DIR}/index.php
+chmod 644 ${FLYNE_DIR}/index.php
+
+if [[ -f "${FLYNE_DIR}/index.php" ]]; then
+    log "API file downloaded successfully!"
+else
+    warn "Failed to download index.php - download manually from GitHub"
+fi
 
 # Save credentials to file
 cat > ${FLYNE_DIR}/credentials.txt << EOF
