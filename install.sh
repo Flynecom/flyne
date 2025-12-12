@@ -5,7 +5,8 @@
 # Optimized for speed, security, and user isolation
 #===============================================================================
 
-set -e
+# Don't exit on errors - we handle them manually
+set +e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 log() { echo -e "${GREEN}[FLYNE]${NC} $1"; }
@@ -710,13 +711,16 @@ Match Group siteusers
     AllowAgentForwarding no
 EOF
 
-systemctl restart sshd
+systemctl restart ssh || systemctl restart sshd || warn "Could not restart SSH service"
 
 #===============================================================================
 # SSL CERTIFICATES
 #===============================================================================
 log "Installing SSL certificates..."
-certbot --nginx -d ${API_DOMAIN} -d ${PMA_DOMAIN} --email ${ADMIN_EMAIL} --agree-tos --non-interactive --redirect || warn "SSL failed - check DNS and try: certbot --nginx -d ${API_DOMAIN} -d ${PMA_DOMAIN}"
+certbot --nginx -d ${API_DOMAIN} -d ${PMA_DOMAIN} --email ${ADMIN_EMAIL} --agree-tos --non-interactive --redirect || {
+    warn "SSL failed - you can run this later:"
+    warn "  certbot --nginx -d ${API_DOMAIN} -d ${PMA_DOMAIN}"
+}
 
 #===============================================================================
 # DATABASE SCHEMA
@@ -1081,8 +1085,8 @@ failregex = ^<HOST> .* "POST /wp-login\.php
 ignoreregex =
 EOF
 
-systemctl enable fail2ban
-systemctl restart fail2ban
+systemctl enable fail2ban || true
+systemctl restart fail2ban || warn "Fail2ban restart failed"
 
 #===============================================================================
 # FIREWALL
@@ -1247,7 +1251,7 @@ vm.dirty_background_ratio = 5
 fs.file-max = 2097152
 fs.nr_open = 2097152
 EOF
-sysctl -p /etc/sysctl.d/99-flyne.conf 2>/dev/null
+sysctl -p /etc/sysctl.d/99-flyne.conf &>/dev/null || warn "Some kernel parameters could not be applied"
 
 # Increase file limits
 cat > /etc/security/limits.d/flyne.conf << 'EOF'
@@ -1262,14 +1266,40 @@ EOF
 #===============================================================================
 log "Verifying installation..."
 
+ERRORS=0
+
 # Test services
-nginx -t || error "Nginx config test failed"
-systemctl is-active --quiet mariadb || error "MariaDB not running"
-systemctl is-active --quiet redis-server || error "Redis not running"
-systemctl is-active --quiet php8.4-fpm || error "PHP-FPM not running"
+if ! nginx -t &>/dev/null; then
+    warn "Nginx config test failed"
+    ERRORS=$((ERRORS + 1))
+fi
+
+if ! systemctl is-active --quiet mariadb; then
+    warn "MariaDB not running"
+    ERRORS=$((ERRORS + 1))
+fi
+
+if ! systemctl is-active --quiet redis-server; then
+    warn "Redis not running"
+    ERRORS=$((ERRORS + 1))
+fi
+
+if ! systemctl is-active --quiet php8.4-fpm; then
+    warn "PHP 8.4-FPM not running"
+    ERRORS=$((ERRORS + 1))
+fi
 
 # Test database connection
-mysql -u root -p"${MYSQL_ROOT_PASS}" -e "SELECT 1" &>/dev/null || error "MySQL connection failed"
+if ! mysql -u root -p"${MYSQL_ROOT_PASS}" -e "SELECT 1" &>/dev/null; then
+    warn "MySQL connection failed"
+    ERRORS=$((ERRORS + 1))
+fi
+
+if [[ $ERRORS -gt 0 ]]; then
+    warn "Installation completed with $ERRORS warning(s)"
+else
+    log "All services verified successfully!"
+fi
 
 #===============================================================================
 # OUTPUT SUMMARY
