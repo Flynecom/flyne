@@ -278,6 +278,98 @@ function deleteSite(string $domain): bool {
     return true;
 }
 
+// ============================================================================
+// WORDPRESS.ORG API HELPERS
+// ============================================================================
+
+function fetchWpOrgPlugins($args = []) {
+    $defaults = ['browse' => 'popular', 'page' => 1, 'per_page' => 12];
+    $args = array_merge($defaults, $args);
+    
+    $queryArgs = [
+        'action' => 'query_plugins',
+        'request[page]' => $args['page'],
+        'request[per_page]' => $args['per_page'],
+        'request[fields][icons]' => 'true',
+        'request[fields][active_installs]' => 'true',
+        'request[fields][short_description]' => 'true',
+        'request[fields][rating]' => 'true',
+        'request[fields][num_ratings]' => 'true',
+        'request[fields][homepage]' => 'true',
+        'request[fields][sections]' => 'false',
+        'request[fields][versions]' => 'false'
+    ];
+    
+    if (!empty($args['search'])) {
+        $queryArgs['request[search]'] = $args['search'];
+    } else {
+        $queryArgs['request[browse]'] = $args['browse'];
+    }
+    
+    $url = 'https://api.wordpress.org/plugins/info/1.2/?' . http_build_query($queryArgs);
+    
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_USERAGENT => 'WordPress/6.4',
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_FOLLOWLOCATION => true
+    ]);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    if ($httpCode !== 200) return null;
+    return json_decode($response, true);
+}
+
+function fetchWpOrgThemes($args = []) {
+    $defaults = ['browse' => 'popular', 'page' => 1, 'per_page' => 12];
+    $args = array_merge($defaults, $args);
+    
+    $queryArgs = [
+        'action' => 'query_themes',
+        'request[page]' => $args['page'],
+        'request[per_page]' => $args['per_page'],
+        'request[fields][screenshot_url]' => 'true',
+        'request[fields][active_installs]' => 'true',
+        'request[fields][description]' => 'true',
+        'request[fields][rating]' => 'true',
+        'request[fields][num_ratings]' => 'true',
+        'request[fields][homepage]' => 'true',
+        'request[fields][sections]' => 'false',
+        'request[fields][versions]' => 'false'
+    ];
+    
+    if (!empty($args['search'])) {
+        $queryArgs['request[search]'] = $args['search'];
+    } else {
+        $queryArgs['request[browse]'] = $args['browse'];
+    }
+    
+    $url = 'https://api.wordpress.org/themes/info/1.2/?' . http_build_query($queryArgs);
+    
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_USERAGENT => 'WordPress/6.4',
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_FOLLOWLOCATION => true
+    ]);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    if ($httpCode !== 200) return null;
+    return json_decode($response, true);
+}
+
 // Helper function for WP-CLI
 function runWpCli(string $domain, string $command): array {
     $site = getSite($domain);
@@ -491,6 +583,23 @@ try {
             if (empty($plugin)) error('Plugin slug required');
             $result = runWpCli($domain, "plugin deactivate $plugin");
             success($result);
+case 'wp_plugin_search':
+        case 'plugin_search':
+            $query = trim($_POST['query'] ?? '');
+            $page = max(1, intval($_POST['page'] ?? 1));
+            $perPage = min(100, max(1, intval($_POST['per_page'] ?? 12)));
+            if (strlen($query) < 2) error('Query too short');
+            $result = fetchWpOrgPlugins(['search' => $query, 'page' => $page, 'per_page' => $perPage]);
+            if (!$result || !isset($result['plugins'])) error('Failed to search plugins');
+            success(['plugins' => $result['plugins'], 'total_pages' => $result['info']['pages'] ?? 1]);
+
+        case 'wp_plugin_popular':
+        case 'plugin_popular':
+            $page = max(1, intval($_POST['page'] ?? 1));
+            $perPage = min(100, max(1, intval($_POST['per_page'] ?? 12)));
+            $result = fetchWpOrgPlugins(['browse' => 'popular', 'page' => $page, 'per_page' => $perPage]);
+            if (!$result || !isset($result['plugins'])) error('Failed to fetch popular plugins');
+            success(['plugins' => $result['plugins'], 'total_pages' => $result['info']['pages'] ?? 1]);
 
         case 'wp_plugin_update_all':
             $result = runWpCli($domain, 'plugin update --all');
@@ -499,6 +608,35 @@ try {
         case 'wp_theme_list':
             $result = runWpCli($domain, 'theme list --format=json');
             success(['themes' => json_decode($result['output'], true) ?? [], 'raw' => $result['output']]);
+case 'wp_theme_install':
+            $theme = $_POST['theme'] ?? '';
+            if (empty($theme)) error('Theme slug required');
+            $result = runWpCli($domain, "theme install $theme");
+            success($result);
+
+        case 'wp_theme_delete':
+            $theme = $_POST['theme'] ?? '';
+            if (empty($theme)) error('Theme slug required');
+            $result = runWpCli($domain, "theme delete $theme");
+            success($result);
+
+        case 'wp_theme_search':
+        case 'theme_search':
+            $query = trim($_POST['query'] ?? '');
+            $page = max(1, intval($_POST['page'] ?? 1));
+            $perPage = min(100, max(1, intval($_POST['per_page'] ?? 12)));
+            if (strlen($query) < 2) error('Query too short');
+            $result = fetchWpOrgThemes(['search' => $query, 'page' => $page, 'per_page' => $perPage]);
+            if (!$result || !isset($result['themes'])) error('Failed to search themes');
+            success(['themes' => $result['themes'], 'total_pages' => $result['info']['pages'] ?? 1]);
+
+        case 'wp_theme_popular':
+        case 'theme_popular':
+            $page = max(1, intval($_POST['page'] ?? 1));
+            $perPage = min(100, max(1, intval($_POST['per_page'] ?? 12)));
+            $result = fetchWpOrgThemes(['browse' => 'popular', 'page' => $page, 'per_page' => $perPage]);
+            if (!$result || !isset($result['themes'])) error('Failed to fetch popular themes');
+            success(['themes' => $result['themes'], 'total_pages' => $result['info']['pages'] ?? 1]);
 
         case 'wp_theme_activate':
             $theme = $_POST['theme'] ?? '';
@@ -543,10 +681,20 @@ try {
             $result = runWpCli($domain, "user create $username $email --role=$role");
             success($result);
 
-        // ===== LEGACY COMPATIBILITY =====
-        case 'plugin_list':
+    case 'plugin_list':
             $result = runWpCli($domain, 'plugin list --format=json');
-            success(['plugins' => json_decode($result['output'], true) ?? []]);
+            $plugins = json_decode($result['output'], true) ?? [];
+            foreach ($plugins as &$plugin) {
+                $slug = $plugin['name'] ?? '';
+                if ($slug) {
+                    $plugin['slug'] = $slug;
+                    $plugin['icons'] = [
+                        '1x' => "https://ps.w.org/{$slug}/assets/icon-128x128.png",
+                        '2x' => "https://ps.w.org/{$slug}/assets/icon-256x256.png"
+                    ];
+                }
+            }
+            success(['plugins' => $plugins]);
 
         case 'plugin_activate':
             $plugin = $_POST['plugin'] ?? '';
@@ -570,7 +718,21 @@ try {
 
         case 'theme_list':
             $result = runWpCli($domain, 'theme list --format=json');
-            success(['themes' => json_decode($result['output'], true) ?? []]);
+            $themes = json_decode($result['output'], true) ?? [];
+            foreach ($themes as &$theme) {
+                $themeName = $theme['name'] ?? '';
+                $themePath = SITES_DIR . "/$domain/public/wp-content/themes/$themeName";
+                $screenshot = null;
+                foreach (['png', 'jpg', 'jpeg', 'gif'] as $ext) {
+                    if (file_exists($themePath . '/screenshot.' . $ext)) {
+                        $screenshot = "/wp-content/themes/$themeName/screenshot.$ext";
+                        break;
+                    }
+                }
+                $theme['screenshot'] = $screenshot ? "https://$domain$screenshot" : null;
+                $theme['slug'] = $themeName;
+            }
+            success(['themes' => $themes]);
 
         case 'theme_activate':
             $theme = $_POST['theme'] ?? $_POST['slug'] ?? '';
@@ -634,32 +796,37 @@ try {
             $size = trim(shell("du -sm " . SITES_DIR . "/$domain | cut -f1")['output']);
             success(['used_mb' => (int)$size]);
 
-     case 'php_version':
-        case 'php_switch':
-            $site = getSite($domain);
-            if (!$site) error('Site not found');
-            
-            $newVersion = $_POST['version'] ?? '';
-            $allowed = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'];
-            if (!in_array($newVersion, $allowed)) {
-                error('Invalid PHP version. Allowed: ' . implode(', ', $allowed));
-            }
-            
-            $oldVersion = $site['php_version'];
-            if ($oldVersion === $newVersion) {
-                success(['version' => $newVersion], 'Already on this version');
-            }
-            
-            $siteDir = SITES_DIR . "/$domain";
-            $logsDir = "$siteDir/logs";
-            $safeUser = $site['user_name'];
-            
-            $poolConf = "[{$domain}]
+case 'php_version':
+case 'php_switch':
+    $site = getSite($domain);
+    if (!$site) error('Site not found');
+    
+    $newVersion = $_POST['version'] ?? '';
+    $allowed = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4'];
+    if (!in_array($newVersion, $allowed)) {
+        error('Invalid PHP version. Allowed: ' . implode(', ', $allowed));
+    }
+    
+    $oldVersion = $site['php_version'];
+    $siteDir = SITES_DIR . "/$domain";
+    $logsDir = "$siteDir/logs";
+    $safeUser = $site['user_name'];
+    
+    $versionNum = str_replace('.', '', $newVersion);
+    $versionedSocket = "/run/php/php-{$domain}.php{$versionNum}.sock";
+    $symlinkPath = "/run/php/php-{$domain}.sock";
+    
+    if ($oldVersion === $newVersion) {
+        success(['version' => $newVersion], 'Already on this version');
+    }
+    
+    $poolConf = "[{$domain}]
 user = {$safeUser}
 group = {$safeUser}
-listen = /run/php/php-{$domain}.sock
+listen = {$versionedSocket}
 listen.owner = www-data
 listen.group = www-data
+listen.mode = 0660
 pm = ondemand
 pm.max_children = 10
 pm.process_idle_timeout = 10s
@@ -671,22 +838,26 @@ php_admin_value[memory_limit] = 256M
 php_admin_value[max_execution_time] = 300
 php_admin_value[error_log] = {$logsDir}/php-error.log
 php_admin_flag[log_errors] = on
+php_admin_value[disable_functions] = exec,shell_exec,system,passthru,popen,proc_open,proc_close,proc_get_status,proc_terminate,proc_nice,posix_kill,symlink,getmypid,getpwuid,posix_getpwuid,pcntl_signal,get_current_user,disk_total_space,disk_free_space,escapeshellcmd,escapeshellarg
 ";
-            
-            // Use sudo to delete old and create new pool config
-            shell("rm -f /etc/php/{$oldVersion}/fpm/pool.d/{$domain}.conf");
-            
-            $tmpFile = "/tmp/pool_{$domain}.conf";
-            file_put_contents($tmpFile, $poolConf);
-            shell("mv {$tmpFile} /etc/php/{$newVersion}/fpm/pool.d/{$domain}.conf");
-            shell("chown root:root /etc/php/{$newVersion}/fpm/pool.d/{$domain}.conf");
-            
-            shell("systemctl restart php{$newVersion}-fpm");
-            shell("systemctl reload php{$oldVersion}-fpm");
-            
-            db()->prepare("UPDATE sites SET php_version = ? WHERE id = ?")->execute([$newVersion, $site['id']]);
-            
-            success(['old_version' => $oldVersion, 'new_version' => $newVersion], 'PHP version changed');
+
+    $newPoolFile = "/etc/php/{$newVersion}/fpm/pool.d/{$domain}.conf";
+    file_put_contents($newPoolFile, $poolConf);
+    chmod($newPoolFile, 0644);
+    
+    db()->prepare("UPDATE sites SET php_version = ? WHERE id = ?")->execute([$newVersion, $site['id']]);
+    
+    $escapedDomain = escapeshellarg($domain);
+    $escapedOld = escapeshellarg($oldVersion);
+    $escapedNew = escapeshellarg($newVersion);
+    
+    exec("sudo /opt/flyne/php-switch.sh $escapedDomain $escapedOld $escapedNew > /dev/null 2>&1 &");
+    
+    success([
+        'old_version' => $oldVersion,
+        'new_version' => $newVersion
+    ], 'PHP version changed');
+
         default:
             error('Unknown action: ' . $action);
     }
