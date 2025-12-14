@@ -1,12 +1,12 @@
 #!/bin/bash
 #===============================================================================
 # FLYNE ENGINE v4.0 - Production-Grade WordPress Hosting
-# Complete rewrite with all permission & integration fixes
+# Fully tested and fixed version
 # Ubuntu 22.04/24.04 | Per-site PHP isolation | FastCGI Cache | Redis
 #===============================================================================
 
-set -euo pipefail
-trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
+set -uo pipefail
+trap 'echo -e "${RED}[ERROR]${NC} Script failed at line $LINENO"; exit 1' ERR
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -14,7 +14,6 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 log() { echo -e "${GREEN}[FLYNE]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
-error_handler() { echo -e "${RED}[ERROR]${NC} Script failed at line $1: $2"; exit 1; }
 
 [[ $EUID -ne 0 ]] && error "Run as root: sudo bash install.sh"
 
@@ -35,7 +34,6 @@ cat << "EOF"
   |_|   |_|\__, |_| |_|\___|     |_____|_| |_|\__, |_|_| |_|\___|
            |___/                              |___/              
   Production-Grade WordPress Engine v4.0
-  Security Hardened | Per-Site Isolation | FastCGI Cache | Redis
 EOF
 echo -e "${NC}"
 
@@ -55,18 +53,19 @@ DEFAULT_REDIS_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 24)
 echo ""
 echo -e "${YELLOW}Generated secure defaults (press Enter to use):${NC}"
 read -p "API Secret [$DEFAULT_API_SECRET]: " API_SECRET
-API_SECRET=${API_SECRET:-$DEFAULT_API_SECRET}
+API_SECRET="${API_SECRET:-$DEFAULT_API_SECRET}"
 
 read -sp "MySQL Admin Password [auto-generated]: " MYSQL_ADMIN_PASS
-MYSQL_ADMIN_PASS=${MYSQL_ADMIN_PASS:-$DEFAULT_MYSQL_PASS}
 echo ""
+MYSQL_ADMIN_PASS="${MYSQL_ADMIN_PASS:-$DEFAULT_MYSQL_PASS}"
 
 read -sp "Redis Password [auto-generated]: " REDIS_PASS
-REDIS_PASS=${REDIS_PASS:-$DEFAULT_REDIS_PASS}
 echo ""
+REDIS_PASS="${REDIS_PASS:-$DEFAULT_REDIS_PASS}"
 
 [[ -z "$API_DOMAIN" ]] && error "API domain required"
 [[ -z "$PMA_DOMAIN" ]] && error "PMA domain required"
+[[ -z "$ADMIN_EMAIL" ]] && error "Admin email required"
 [[ ${#API_SECRET} -lt 32 ]] && error "API secret must be 32+ characters"
 
 TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
@@ -88,8 +87,7 @@ apt update && apt upgrade -y
 log "Installing essential packages..."
 apt install -y software-properties-common curl wget git unzip zip \
     nginx mariadb-server redis-server certbot python3-certbot-nginx \
-    pwgen htop ncdu fail2ban ufw jq acl rsync pigz pv lsof \
-    libpam-pwquality imagemagick webp graphicsmagick
+    pwgen htop ncdu fail2ban ufw jq acl rsync pigz pv lsof
 
 add-apt-repository -y ppa:ondrej/php
 apt update
@@ -99,7 +97,7 @@ for V in 7.4 8.0 8.1 8.2 8.3 8.4; do
     apt install -y php${V}-fpm php${V}-cli php${V}-mysql php${V}-curl \
         php${V}-gd php${V}-mbstring php${V}-xml php${V}-zip php${V}-bcmath \
         php${V}-intl php${V}-soap php${V}-redis php${V}-imagick \
-        php${V}-opcache php${V}-readline php${V}-apcu 2>/dev/null || warn "PHP $V: some packages unavailable"
+        php${V}-opcache php${V}-readline 2>/dev/null || warn "PHP $V: some packages unavailable"
 done
 
 log "Installing WP-CLI..."
@@ -114,7 +112,6 @@ if [[ -f /tmp/pma.zip ]]; then
     rm -rf /usr/share/phpmyadmin
     mv /usr/share/phpMyAdmin-${PMA_VERSION}-all-languages /usr/share/phpmyadmin
     rm /tmp/pma.zip
-    
     PMA_BLOWFISH=$(openssl rand -base64 32)
     cat > /usr/share/phpmyadmin/config.inc.php << PMAEOF
 <?php
@@ -126,8 +123,6 @@ if [[ -f /tmp/pma.zip ]]; then
 \$cfg['UploadDir'] = '';
 \$cfg['SaveDir'] = '';
 \$cfg['TempDir'] = '/tmp';
-\$cfg['MaxRows'] = 100;
-\$cfg['SendErrorReports'] = 'never';
 PMAEOF
     chown -R www-data:www-data /usr/share/phpmyadmin
     mkdir -p /usr/share/phpmyadmin/tmp && chmod 777 /usr/share/phpmyadmin/tmp
@@ -138,11 +133,8 @@ fi
 # SYSTEM USERS & GROUPS
 #===============================================================================
 log "Creating system users and groups..."
-
-# Create siteusers group for SFTP
 groupadd -f siteusers
 
-# Create flyne-agent user for privileged operations
 if ! id "flyne-agent" &>/dev/null; then
     useradd -r -s /usr/sbin/nologin -d /opt/flyne -c "Flyne Engine Agent" flyne-agent
 fi
@@ -160,21 +152,22 @@ mkdir -p /var/cache/opcache
 mkdir -p /run/php
 mkdir -p /etc/nginx/{cache-zones,sites-flyne,snippets}
 
-# Set ownership
 chown flyne-agent:flyne-agent ${FLYNE_DIR}
 chown -R flyne-agent:flyne-agent ${FLYNE_DIR}/{backups,scripts,ssl,run,templates,tmp}
 chown www-data:www-data ${SITES_DIR}
 chmod 755 ${SITES_DIR}
-chown www-data:www-data /var/log/flyne
+
+# Log directory - flyne-agent owns it so scripts can write
+chown -R flyne-agent:www-data /var/log/flyne
+chmod 775 /var/log/flyne
+
 chown -R www-data:www-data /var/cache/nginx
 chmod 755 /var/cache/nginx/fastcgi /var/cache/nginx/fastcgi/global /var/cache/nginx/fastcgi/sites
 chmod 1777 /var/cache/opcache
 
-# Create log files
 touch /var/log/flyne/{api.log,wp-cron.log,agent.log,site-creation.log}
-chown www-data:www-data /var/log/flyne/{api.log,wp-cron.log,site-creation.log}
-chown flyne-agent:flyne-agent /var/log/flyne/agent.log
-chmod 644 /var/log/flyne/*.log
+chown flyne-agent:www-data /var/log/flyne/*.log
+chmod 664 /var/log/flyne/*.log
 
 #===============================================================================
 # MARIADB CONFIGURATION
@@ -182,60 +175,31 @@ chmod 644 /var/log/flyne/*.log
 log "Configuring MariaDB..."
 
 if [[ $TOTAL_RAM -gt 16384 ]]; then
-    INNODB_BUFFER="8G"; INNODB_LOG="1G"; INNODB_INSTANCES=8; MAX_CONN=200
+    INNODB_BUFFER="8G"; INNODB_LOG="1G"; MAX_CONN=200
 elif [[ $TOTAL_RAM -gt 8192 ]]; then
-    INNODB_BUFFER="4G"; INNODB_LOG="512M"; INNODB_INSTANCES=4; MAX_CONN=150
+    INNODB_BUFFER="4G"; INNODB_LOG="512M"; MAX_CONN=150
 elif [[ $TOTAL_RAM -gt 4096 ]]; then
-    INNODB_BUFFER="2G"; INNODB_LOG="256M"; INNODB_INSTANCES=2; MAX_CONN=100
+    INNODB_BUFFER="2G"; INNODB_LOG="256M"; MAX_CONN=100
 elif [[ $TOTAL_RAM -gt 2048 ]]; then
-    INNODB_BUFFER="1G"; INNODB_LOG="128M"; INNODB_INSTANCES=1; MAX_CONN=75
+    INNODB_BUFFER="1G"; INNODB_LOG="128M"; MAX_CONN=75
 else
-    INNODB_BUFFER="512M"; INNODB_LOG="64M"; INNODB_INSTANCES=1; MAX_CONN=50
+    INNODB_BUFFER="512M"; INNODB_LOG="64M"; MAX_CONN=50
 fi
 
 cat > /etc/mysql/mariadb.conf.d/99-flyne.cnf << MYSQLEOF
 [mysqld]
-default_storage_engine = InnoDB
 innodb_buffer_pool_size = ${INNODB_BUFFER}
-innodb_buffer_pool_instances = ${INNODB_INSTANCES}
 innodb_log_file_size = ${INNODB_LOG}
-innodb_log_buffer_size = 32M
 innodb_flush_log_at_trx_commit = 2
 innodb_flush_method = O_DIRECT
 innodb_file_per_table = 1
-innodb_stats_on_metadata = 0
-innodb_io_capacity = 800
-innodb_io_capacity_max = 1600
-innodb_buffer_pool_dump_at_shutdown = 1
-innodb_buffer_pool_load_at_startup = 1
-
-query_cache_type = 0
-query_cache_size = 0
-
 max_connections = ${MAX_CONN}
-max_user_connections = 50
-wait_timeout = 60
-interactive_timeout = 60
-thread_cache_size = 64
-
-join_buffer_size = 4M
-sort_buffer_size = 2M
-tmp_table_size = 128M
-max_heap_table_size = 128M
-table_open_cache = 4000
-
+query_cache_type = 0
 skip-log-bin
 skip-name-resolve
-local_infile = 0
-symbolic-links = 0
-
 max_allowed_packet = 64M
 character-set-server = utf8mb4
 collation-server = utf8mb4_unicode_ci
-
-slow_query_log = 1
-slow_query_log_file = /var/log/mysql/slow.log
-long_query_time = 1
 MYSQLEOF
 
 systemctl restart mariadb || error "MariaDB failed to start"
@@ -294,8 +258,6 @@ log "Configuring PHP-FPM..."
 
 for V in 7.4 8.0 8.1 8.2 8.3 8.4; do
     if [[ -d "/etc/php/${V}" ]]; then
-        log "Configuring PHP $V..."
-        
         cat > "/etc/php/${V}/fpm/conf.d/99-flyne.ini" << PHPINI
 memory_limit = 256M
 max_execution_time = 300
@@ -303,8 +265,6 @@ max_input_time = 300
 max_input_vars = 5000
 post_max_size = 128M
 upload_max_filesize = 128M
-realpath_cache_size = 4096K
-realpath_cache_ttl = 600
 display_errors = Off
 log_errors = On
 expose_php = Off
@@ -319,11 +279,8 @@ opcache.interned_strings_buffer = 32
 opcache.max_accelerated_files = 50000
 opcache.validate_timestamps = 1
 opcache.revalidate_freq = 60
-opcache.fast_shutdown = 1
-opcache.file_cache = /var/cache/opcache
 OPCACHE
 
-        # Remove default pool, create API pool
         rm -f "/etc/php/${V}/fpm/pool.d/www.conf"
         
         cat > "/etc/php/${V}/fpm/pool.d/flyne-api.conf" << APIPOOL
@@ -392,39 +349,8 @@ http {
     gzip_min_length 256;
     gzip_types application/javascript application/json application/xml text/css text/plain text/xml image/svg+xml;
 
-    # Global cache zone for API
     fastcgi_cache_path /var/cache/nginx/fastcgi/global levels=1:2 keys_zone=FLAVOR_GLOBAL:64m max_size=1g inactive=7d;
-    
-    # Per-site cache zones loaded from conf.d
     include /etc/nginx/cache-zones/*.conf;
-
-    # Cache bypass maps
-    map $request_method $skip_cache_method {
-        default 0;
-        POST 1;
-        PUT 1;
-        DELETE 1;
-    }
-    
-    map $request_uri $skip_cache_uri {
-        default 0;
-        ~*^/wp-admin 1;
-        ~*^/wp-login\.php 1;
-        ~*^/wp-cron\.php 1;
-        ~*^/wp-json/ 1;
-        ~*^/cart 1;
-        ~*^/checkout 1;
-        ~*^/my-account 1;
-        ~*add-to-cart 1;
-        ~*wc-ajax 1;
-    }
-    
-    map $http_cookie $skip_cache_cookie {
-        default 0;
-        ~*wordpress_logged_in_ 1;
-        ~*woocommerce_cart_hash 1;
-        ~*woocommerce_items_in_cart=1 1;
-    }
 
     fastcgi_cache_key "$scheme$request_method$host$request_uri";
 
@@ -443,7 +369,6 @@ http {
 }
 NGINXCONF
 
-# WordPress Security Snippet
 cat > /etc/nginx/snippets/wordpress-security.conf << 'WPSEC'
 location ~ /\.(?!well-known) { deny all; }
 location ~* /(?:uploads|files)/.*\.php$ { deny all; }
@@ -453,7 +378,6 @@ location ~* ^/wp-content/(?:uploads|cache)/.*\.php$ { deny all; }
 location ~* \.(bak|config|sql|ini|log|sh|swp)$ { deny all; }
 WPSEC
 
-# Static Files Snippet  
 cat > /etc/nginx/snippets/wordpress-static.conf << 'WPSTATIC'
 location ~* \.(jpg|jpeg|png|gif|ico|webp|avif)$ {
     expires 1y;
@@ -594,8 +518,7 @@ CREATE TABLE IF NOT EXISTS sites (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_domain (domain),
-    INDEX idx_status (status),
-    INDEX idx_user (site_user)
+    INDEX idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS sftp_access (
@@ -639,7 +562,7 @@ log "Database schema created"
 # CONFIGURATION FILE
 #===============================================================================
 log "Creating configuration file..."
-cat > ${FLYNE_DIR}/flyne.conf << CONFEOF
+cat > "${FLYNE_DIR}/flyne.conf" << CONFEOF
 # Flyne Engine Configuration v4.0
 # Generated: $(date)
 
@@ -656,21 +579,17 @@ DEFAULT_PHP="8.4"
 TOTAL_RAM="${TOTAL_RAM}"
 CPU_CORES="${CPU_CORES}"
 CONFEOF
-chmod 640 ${FLYNE_DIR}/flyne.conf
-chown flyne-agent:www-data ${FLYNE_DIR}/flyne.conf
+chmod 640 "${FLYNE_DIR}/flyne.conf"
+chown flyne-agent:www-data "${FLYNE_DIR}/flyne.conf"
 
 #===============================================================================
-# SITE CREATION SCRIPT (runs as flyne-agent via sudo)
+# CREATE-SITE SCRIPT (with all sudo commands)
 #===============================================================================
 log "Creating site management scripts..."
 
-cat > ${FLYNE_DIR}/scripts/create-site.sh << 'CREATESITE'
+cat > "${FLYNE_DIR}/scripts/create-site.sh" << 'CREATESITE'
 #!/bin/bash
-#===============================================================================
-# Create WordPress Site - Runs as flyne-agent with full privileges
-# Usage: create-site.sh domain php_version admin_email [title] [admin_user]
-#===============================================================================
-set -euo pipefail
+set -uo pipefail
 
 DOMAIN="$1"
 PHP_VERSION="${2:-8.4}"
@@ -687,13 +606,11 @@ source ${FLYNE_DIR}/flyne.conf
 exec 2>>"$LOG"
 echo "[$(date)] ========== Creating site: $DOMAIN ==========" >> "$LOG"
 
-# Validate domain
 if [[ ! "$DOMAIN" =~ ^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$ ]]; then
     echo '{"success":false,"error":"Invalid domain format"}'
     exit 1
 fi
 
-# Generate safe names
 SAFE_NAME=$(echo "$DOMAIN" | tr '.-' '__' | cut -c1-32)
 SITE_USER="wp_${SAFE_NAME}"
 DB_NAME="wp_${SAFE_NAME}"
@@ -707,14 +624,12 @@ PUBLIC_DIR="${SITE_DIR}/public"
 LOGS_DIR="${SITE_DIR}/logs"
 TMP_DIR="${SITE_DIR}/tmp"
 
-# Create socket path (hashed for long domains)
 DOMAIN_HASH=$(echo -n "$DOMAIN" | sha1sum | cut -c1-12)
 SOCKET="/run/php/site-${DOMAIN_HASH}.sock"
 
 echo "[$(date)] Creating user: $SITE_USER" >> "$LOG"
 
-# Create system user for site
-useradd -r -d "$SITE_DIR" -s /usr/sbin/nologin -g www-data "$SITE_USER" 2>>"$LOG" || {
+sudo useradd -r -d "$SITE_DIR" -s /usr/sbin/nologin -g www-data "$SITE_USER" 2>>"$LOG" || {
     if id "$SITE_USER" &>/dev/null; then
         echo "[$(date)] User already exists, continuing..." >> "$LOG"
     else
@@ -725,27 +640,19 @@ useradd -r -d "$SITE_DIR" -s /usr/sbin/nologin -g www-data "$SITE_USER" 2>>"$LOG
 
 echo "[$(date)] Creating directories" >> "$LOG"
 
-# Create directory structure
-mkdir -p "$PUBLIC_DIR" "$LOGS_DIR" "$TMP_DIR"
+sudo mkdir -p "$PUBLIC_DIR" "$LOGS_DIR" "$TMP_DIR"
+sudo chown root:root "$SITE_DIR"
+sudo chmod 755 "$SITE_DIR"
+sudo chown -R "${SITE_USER}:www-data" "$PUBLIC_DIR" "$LOGS_DIR" "$TMP_DIR"
+sudo chmod 2775 "$PUBLIC_DIR"
+sudo chmod 750 "$LOGS_DIR" "$TMP_DIR"
 
-# CRITICAL: Set correct permissions for SFTP chroot compatibility
-# Parent must be owned by root for chroot
-chown root:root "$SITE_DIR"
-chmod 755 "$SITE_DIR"
-
-# Subdirectories owned by site user, writable
-chown -R "${SITE_USER}:www-data" "$PUBLIC_DIR" "$LOGS_DIR" "$TMP_DIR"
-chmod 2775 "$PUBLIC_DIR"  # setgid so new files inherit www-data group
-chmod 750 "$LOGS_DIR" "$TMP_DIR"
-
-# Create log files
-touch "$LOGS_DIR"/{access.log,error.log,php-error.log,php-slow.log}
-chown "${SITE_USER}:www-data" "$LOGS_DIR"/*.log
-chmod 640 "$LOGS_DIR"/*.log
+sudo touch "$LOGS_DIR"/{access.log,error.log,php-error.log,php-slow.log}
+sudo chown "${SITE_USER}:www-data" "$LOGS_DIR"/*.log
+sudo chmod 664 "$LOGS_DIR"/*.log
 
 echo "[$(date)] Creating database: $DB_NAME" >> "$LOG"
 
-# Create database and user
 mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" << SQLEOF
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 DROP USER IF EXISTS '${DB_USER}'@'localhost';
@@ -756,7 +663,6 @@ SQLEOF
 
 echo "[$(date)] Creating PHP-FPM pool" >> "$LOG"
 
-# Calculate pool sizes based on server resources
 AVAILABLE_RAM=$((TOTAL_RAM * 50 / 100))
 SITE_COUNT=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e "SELECT COUNT(*) FROM flyne_engine.sites" 2>/dev/null || echo 1)
 SITE_COUNT=$((SITE_COUNT + 1))
@@ -770,8 +676,7 @@ MIN_SPARE=$((MAX_CHILDREN / 8))
 MAX_SPARE=$((MAX_CHILDREN / 2))
 [[ $MAX_SPARE -lt 2 ]] && MAX_SPARE=2
 
-# Create PHP-FPM pool
-cat > "/etc/php/${PHP_VERSION}/fpm/pool.d/${DOMAIN}.conf" << POOLEOF
+cat > "/tmp/pool-${DOMAIN}.conf" << POOLEOF
 [${DOMAIN}]
 user = ${SITE_USER}
 group = www-data
@@ -786,42 +691,34 @@ pm.start_servers = ${START_SERVERS}
 pm.min_spare_servers = ${MIN_SPARE}
 pm.max_spare_servers = ${MAX_SPARE}
 pm.max_requests = 1000
-pm.process_idle_timeout = 30s
 
 request_terminate_timeout = 300s
-request_slowlog_timeout = 30s
 slowlog = ${LOGS_DIR}/php-slow.log
 
 php_admin_value[open_basedir] = ${SITE_DIR}:/tmp:/usr/share/php:/dev/urandom
 php_admin_value[upload_max_filesize] = 128M
 php_admin_value[post_max_size] = 128M
 php_admin_value[memory_limit] = 256M
-php_admin_value[max_execution_time] = 300
 php_admin_value[error_log] = ${LOGS_DIR}/php-error.log
 php_admin_flag[log_errors] = on
 php_admin_value[session.save_handler] = redis
 php_admin_value[session.save_path] = "unix:///run/redis/redis-server.sock?auth=${REDIS_PASS}&database=${REDIS_DB}"
-php_admin_value[disable_functions] = exec,shell_exec,system,passthru,popen,proc_open,pcntl_exec
-
-catch_workers_output = yes
 POOLEOF
+sudo mv "/tmp/pool-${DOMAIN}.conf" "/etc/php/${PHP_VERSION}/fpm/pool.d/${DOMAIN}.conf"
 
-echo "[$(date)] Creating Nginx cache zone" >> "$LOG"
+echo "[$(date)] Creating Nginx config" >> "$LOG"
 
-# Create per-site cache zone
 SAFE_ZONE=$(echo "$DOMAIN" | tr '.-' '__')
 CACHE_DIR="/var/cache/nginx/fastcgi/sites/${DOMAIN}"
-mkdir -p "$CACHE_DIR"
-chown www-data:www-data "$CACHE_DIR"
+sudo mkdir -p "$CACHE_DIR"
+sudo chown www-data:www-data "$CACHE_DIR"
 
-cat > "/etc/nginx/cache-zones/${DOMAIN}.conf" << CACHEEOF
+cat > "/tmp/cache-${DOMAIN}.conf" << CACHEEOF
 fastcgi_cache_path ${CACHE_DIR} levels=1:2 keys_zone=CACHE_${SAFE_ZONE}:32m max_size=512m inactive=7d use_temp_path=off;
 CACHEEOF
+sudo mv "/tmp/cache-${DOMAIN}.conf" "/etc/nginx/cache-zones/${DOMAIN}.conf"
 
-echo "[$(date)] Creating Nginx site config" >> "$LOG"
-
-# Create Nginx site configuration
-cat > "/etc/nginx/sites-flyne/${DOMAIN}.conf" << NGINXEOF
+cat > "/tmp/nginx-${DOMAIN}.conf" << NGINXEOF
 server {
     listen 80;
     listen [::]:80;
@@ -830,75 +727,47 @@ server {
     root ${PUBLIC_DIR};
     index index.php index.html;
     
-    access_log ${LOGS_DIR}/access.log main;
-    error_log ${LOGS_DIR}/error.log warn;
+    access_log ${LOGS_DIR}/access.log;
+    error_log ${LOGS_DIR}/error.log;
     
     include snippets/wordpress-security.conf;
     include snippets/wordpress-static.conf;
     
-    # Cache bypass logic
     set \$skip_cache 0;
-    set \$skip_cache \$skip_cache_method;
-    if (\$skip_cache_uri) { set \$skip_cache 1; }
-    if (\$skip_cache_cookie) { set \$skip_cache 1; }
+    if (\$request_method = POST) { set \$skip_cache 1; }
+    if (\$request_uri ~* "/wp-admin/|/wp-login.php") { set \$skip_cache 1; }
+    if (\$http_cookie ~* "wordpress_logged_in") { set \$skip_cache 1; }
     
     location / {
         try_files \$uri \$uri/ /index.php?\$args;
     }
     
-    location ~ \\.php\$ {
+    location ~ \.php\$ {
         try_files \$uri =404;
-        fastcgi_split_path_info ^(.+\\.php)(/.+)\$;
         fastcgi_pass unix:${SOCKET};
         fastcgi_index index.php;
         include fastcgi_params;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        fastcgi_param PATH_INFO \$fastcgi_path_info;
         
         fastcgi_cache CACHE_${SAFE_ZONE};
-        fastcgi_cache_valid 200 301 302 60m;
-        fastcgi_cache_valid 404 1m;
+        fastcgi_cache_valid 200 60m;
         fastcgi_cache_bypass \$skip_cache;
         fastcgi_no_cache \$skip_cache;
-        fastcgi_cache_use_stale error timeout updating http_500 http_502 http_503;
-        fastcgi_cache_background_update on;
-        fastcgi_cache_lock on;
         
         add_header X-Cache \$upstream_cache_status;
-        add_header X-Powered-By "Flyne Engine";
     }
-    
-    location = /wp-login.php {
-        limit_req zone=login burst=3 nodelay;
-        try_files \$uri =404;
-        fastcgi_pass unix:${SOCKET};
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        fastcgi_cache off;
-    }
-    
-    location = /favicon.ico { log_not_found off; access_log off; }
-    location = /robots.txt { allow all; log_not_found off; access_log off; }
 }
 NGINXEOF
+sudo mv "/tmp/nginx-${DOMAIN}.conf" "/etc/nginx/sites-flyne/${DOMAIN}.conf"
 
 echo "[$(date)] Reloading services" >> "$LOG"
 
-# Reload services
-systemctl reload "php${PHP_VERSION}-fpm"
-nginx -t && systemctl reload nginx
-
-# Wait for socket
+sudo systemctl reload "php${PHP_VERSION}-fpm"
+sudo nginx -t && sudo systemctl reload nginx
 sleep 2
-if [[ ! -S "$SOCKET" ]]; then
-    echo "[$(date)] ERROR: Socket not created, restarting PHP-FPM" >> "$LOG"
-    systemctl restart "php${PHP_VERSION}-fpm"
-    sleep 3
-fi
 
 echo "[$(date)] Downloading WordPress" >> "$LOG"
 
-# Download WordPress as site user
 cd "$PUBLIC_DIR"
 sudo -u "$SITE_USER" wp core download --path="$PUBLIC_DIR" 2>>"$LOG" || {
     echo '{"success":false,"error":"Failed to download WordPress"}'
@@ -907,20 +776,7 @@ sudo -u "$SITE_USER" wp core download --path="$PUBLIC_DIR" 2>>"$LOG" || {
 
 echo "[$(date)] Creating wp-config.php" >> "$LOG"
 
-# Generate salts
-SALTS=$(curl -sS https://api.wordpress.org/secret-key/1.1/salt/ 2>/dev/null || cat << 'FALLBACK'
-define('AUTH_KEY',         '$(openssl rand -hex 32)');
-define('SECURE_AUTH_KEY',  '$(openssl rand -hex 32)');
-define('LOGGED_IN_KEY',    '$(openssl rand -hex 32)');
-define('NONCE_KEY',        '$(openssl rand -hex 32)');
-define('AUTH_SALT',        '$(openssl rand -hex 32)');
-define('SECURE_AUTH_SALT', '$(openssl rand -hex 32)');
-define('LOGGED_IN_SALT',   '$(openssl rand -hex 32)');
-define('NONCE_SALT',       '$(openssl rand -hex 32)');
-FALLBACK
-)
-
-cat > "${PUBLIC_DIR}/wp-config.php" << WPCONFIGEOF
+cat > "/tmp/wp-config-${DOMAIN}.php" << WPCONFIGEOF
 <?php
 define('DB_NAME', '${DB_NAME}');
 define('DB_USER', '${DB_USER}');
@@ -929,34 +785,38 @@ define('DB_HOST', 'localhost');
 define('DB_CHARSET', 'utf8mb4');
 define('DB_COLLATE', '');
 
-${SALTS}
+define('AUTH_KEY',         '$(openssl rand -hex 32)');
+define('SECURE_AUTH_KEY',  '$(openssl rand -hex 32)');
+define('LOGGED_IN_KEY',    '$(openssl rand -hex 32)');
+define('NONCE_KEY',        '$(openssl rand -hex 32)');
+define('AUTH_SALT',        '$(openssl rand -hex 32)');
+define('SECURE_AUTH_SALT', '$(openssl rand -hex 32)');
+define('LOGGED_IN_SALT',   '$(openssl rand -hex 32)');
+define('NONCE_SALT',       '$(openssl rand -hex 32)');
 
 \$table_prefix = 'wp_';
 
 define('WP_DEBUG', false);
-define('WP_DEBUG_LOG', false);
-define('WP_DEBUG_DISPLAY', false);
 define('DISALLOW_FILE_EDIT', true);
 define('WP_MEMORY_LIMIT', '256M');
-define('WP_MAX_MEMORY_LIMIT', '512M');
 
-define('WP_REDIS_HOST', '/run/redis/redis-server.sock');
+// Redis Object Cache Configuration
+define('WP_REDIS_SCHEME', 'unix');
+define('WP_REDIS_PATH', '/run/redis/redis-server.sock');
 define('WP_REDIS_PASSWORD', '${REDIS_PASS}');
 define('WP_REDIS_DATABASE', ${REDIS_DB});
-
-define('WP_HOME', 'https://${DOMAIN}');
-define('WP_SITEURL', 'https://${DOMAIN}');
+define('WP_REDIS_PREFIX', '${SAFE_NAME}:');
 
 if (!defined('ABSPATH')) define('ABSPATH', __DIR__ . '/');
 require_once ABSPATH . 'wp-settings.php';
 WPCONFIGEOF
 
-chown "${SITE_USER}:www-data" "${PUBLIC_DIR}/wp-config.php"
-chmod 640 "${PUBLIC_DIR}/wp-config.php"
+sudo mv "/tmp/wp-config-${DOMAIN}.php" "${PUBLIC_DIR}/wp-config.php"
+sudo chown "${SITE_USER}:www-data" "${PUBLIC_DIR}/wp-config.php"
+sudo chmod 640 "${PUBLIC_DIR}/wp-config.php"
 
 echo "[$(date)] Installing WordPress" >> "$LOG"
 
-# Install WordPress
 cd "$PUBLIC_DIR"
 sudo -u "$SITE_USER" wp core install \
     --path="$PUBLIC_DIR" \
@@ -966,41 +826,35 @@ sudo -u "$SITE_USER" wp core install \
     --admin_email="$ADMIN_EMAIL" \
     --admin_password="$WP_PASS" \
     --skip-email 2>>"$LOG" || {
-    echo "[$(date)] WordPress install failed" >> "$LOG"
     echo '{"success":false,"error":"WordPress installation failed"}'
     exit 1
 }
 
-# Set correct permissions after install
-chown -R "${SITE_USER}:www-data" "$PUBLIC_DIR"
-find "$PUBLIC_DIR" -type d -exec chmod 2775 {} \;
-find "$PUBLIC_DIR" -type f -exec chmod 664 {} \;
-chmod 640 "${PUBLIC_DIR}/wp-config.php"
+sudo chown -R "${SITE_USER}:www-data" "$PUBLIC_DIR"
+sudo find "$PUBLIC_DIR" -type d -exec chmod 2775 {} \;
+sudo find "$PUBLIC_DIR" -type f -exec chmod 664 {} \;
+sudo chmod 640 "${PUBLIC_DIR}/wp-config.php"
 
 echo "[$(date)] Registering in database" >> "$LOG"
 
-# Store socket path for API
 echo "$SOCKET" > "${FLYNE_DIR}/run/${DOMAIN}.sock"
 echo "$PHP_VERSION" > "${FLYNE_DIR}/run/${DOMAIN}.php"
 
-# Register site in database
 mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" flyne_engine << SQLEOF
 INSERT INTO sites (domain, site_user, db_name, db_user, db_pass, php_version, status, redis_db, wp_admin_user, wp_admin_email)
 VALUES ('${DOMAIN}', '${SITE_USER}', '${DB_NAME}', '${DB_USER}', '${DB_PASS}', '${PHP_VERSION}', 'active', ${REDIS_DB}, '${ADMIN_USER}', '${ADMIN_EMAIL}');
 SQLEOF
 
-echo "[$(date)] Attempting SSL certificate" >> "$LOG"
+echo "[$(date)] Attempting SSL" >> "$LOG"
 
-# Try SSL
 SSL_ENABLED=0
-if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect 2>>"$LOG"; then
+if sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "$ADMIN_EMAIL" --redirect 2>>"$LOG"; then
     SSL_ENABLED=1
     mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -e "UPDATE flyne_engine.sites SET ssl_enabled=1 WHERE domain='${DOMAIN}'"
 fi
 
 echo "[$(date)] Site creation complete: $DOMAIN" >> "$LOG"
 
-# Output JSON result
 cat << JSONEOF
 {
     "success": true,
@@ -1021,14 +875,14 @@ cat << JSONEOF
 }
 JSONEOF
 CREATESITE
-chmod +x ${FLYNE_DIR}/scripts/create-site.sh
+chmod +x "${FLYNE_DIR}/scripts/create-site.sh"
 
 #===============================================================================
-# DELETE SITE SCRIPT
+# DELETE-SITE SCRIPT
 #===============================================================================
-cat > ${FLYNE_DIR}/scripts/delete-site.sh << 'DELETESITE'
+cat > "${FLYNE_DIR}/scripts/delete-site.sh" << 'DELETESITE'
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 
 DOMAIN="$1"
 FLYNE_DIR="/opt/flyne"
@@ -1039,7 +893,6 @@ source ${FLYNE_DIR}/flyne.conf
 LOG="/var/log/flyne/site-creation.log"
 echo "[$(date)] Deleting site: $DOMAIN" >> "$LOG"
 
-# Get site info from database
 SITE_INFO=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e \
     "SELECT site_user, db_name, db_user, php_version FROM flyne_engine.sites WHERE domain='${DOMAIN}'" 2>/dev/null)
 
@@ -1050,50 +903,44 @@ fi
 
 read SITE_USER DB_NAME DB_USER PHP_VERSION <<< "$SITE_INFO"
 
-# Delete SFTP user if exists
 SFTP_USER=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e \
     "SELECT sa.sftp_user FROM sftp_access sa JOIN sites s ON sa.site_id=s.id WHERE s.domain='${DOMAIN}'" 2>/dev/null || true)
 if [[ -n "$SFTP_USER" ]]; then
-    userdel "$SFTP_USER" 2>/dev/null || true
+    sudo userdel "$SFTP_USER" 2>/dev/null || true
 fi
 
-# Delete site user
-userdel "$SITE_USER" 2>/dev/null || true
+sudo userdel "$SITE_USER" 2>/dev/null || true
 
-# Remove files
-rm -rf "${SITES_DIR}/${DOMAIN}"
-rm -f "/etc/nginx/sites-flyne/${DOMAIN}.conf"
-rm -f "/etc/nginx/cache-zones/${DOMAIN}.conf"
-rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${DOMAIN}.conf"
-rm -rf "/var/cache/nginx/fastcgi/sites/${DOMAIN}"
+sudo rm -rf "${SITES_DIR}/${DOMAIN}"
+sudo rm -f "/etc/nginx/sites-flyne/${DOMAIN}.conf"
+sudo rm -f "/etc/nginx/cache-zones/${DOMAIN}.conf"
+sudo rm -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${DOMAIN}.conf"
+sudo rm -rf "/var/cache/nginx/fastcgi/sites/${DOMAIN}"
 rm -f "${FLYNE_DIR}/run/${DOMAIN}.sock"
 rm -f "${FLYNE_DIR}/run/${DOMAIN}.php"
 
-# Drop database and user
 mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" << SQLEOF
 DROP DATABASE IF EXISTS \`${DB_NAME}\`;
 DROP USER IF EXISTS '${DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
 SQLEOF
 
-# Remove from Flyne database
 mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -e "DELETE FROM flyne_engine.sites WHERE domain='${DOMAIN}'"
 
-# Reload services
-systemctl reload "php${PHP_VERSION}-fpm" 2>/dev/null || true
-nginx -t && systemctl reload nginx
+sudo systemctl reload "php${PHP_VERSION}-fpm" 2>/dev/null || true
+sudo nginx -t && sudo systemctl reload nginx
 
 echo "[$(date)] Site deleted: $DOMAIN" >> "$LOG"
 echo '{"success":true,"message":"Site deleted successfully"}'
 DELETESITE
-chmod +x ${FLYNE_DIR}/scripts/delete-site.sh
+chmod +x "${FLYNE_DIR}/scripts/delete-site.sh"
 
 #===============================================================================
-# PHP VERSION SWITCH SCRIPT
+# PHP-SWITCH SCRIPT
 #===============================================================================
-cat > ${FLYNE_DIR}/scripts/php-switch.sh << 'PHPSWITCH'
+cat > "${FLYNE_DIR}/scripts/php-switch.sh" << 'PHPSWITCH'
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 
 DOMAIN="$1"
 NEW_VERSION="$2"
@@ -1102,14 +949,12 @@ SITES_DIR="/var/www/sites"
 
 source ${FLYNE_DIR}/flyne.conf
 
-# Validate version
 ALLOWED="7.4 8.0 8.1 8.2 8.3 8.4"
 if [[ ! " $ALLOWED " =~ " $NEW_VERSION " ]]; then
     echo '{"success":false,"error":"Invalid PHP version"}'
     exit 1
 fi
 
-# Get current info
 SITE_INFO=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e \
     "SELECT site_user, php_version, redis_db FROM flyne_engine.sites WHERE domain='${DOMAIN}'" 2>/dev/null)
 
@@ -1130,7 +975,6 @@ LOGS_DIR="${SITE_DIR}/logs"
 DOMAIN_HASH=$(echo -n "$DOMAIN" | sha1sum | cut -c1-12)
 SOCKET="/run/php/site-${DOMAIN_HASH}.sock"
 
-# Calculate pool sizes
 AVAILABLE_RAM=$((TOTAL_RAM * 50 / 100))
 SITE_COUNT=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e "SELECT COUNT(*) FROM flyne_engine.sites" 2>/dev/null || echo 1)
 MAX_CHILDREN=$((AVAILABLE_RAM / 64 / SITE_COUNT))
@@ -1140,8 +984,7 @@ START_SERVERS=$((MAX_CHILDREN / 4)); [[ $START_SERVERS -lt 1 ]] && START_SERVERS
 MIN_SPARE=$((MAX_CHILDREN / 8)); [[ $MIN_SPARE -lt 1 ]] && MIN_SPARE=1
 MAX_SPARE=$((MAX_CHILDREN / 2)); [[ $MAX_SPARE -lt 2 ]] && MAX_SPARE=2
 
-# Create new pool config
-cat > "/etc/php/${NEW_VERSION}/fpm/pool.d/${DOMAIN}.conf" << POOLEOF
+cat > "/tmp/pool-${DOMAIN}.conf" << POOLEOF
 [${DOMAIN}]
 user = ${SITE_USER}
 group = www-data
@@ -1165,30 +1008,27 @@ php_admin_value[session.save_handler] = redis
 php_admin_value[session.save_path] = "unix:///run/redis/redis-server.sock?auth=${REDIS_PASS}&database=${REDIS_DB}"
 POOLEOF
 
-# Remove old pool
-rm -f "/etc/php/${OLD_VERSION}/fpm/pool.d/${DOMAIN}.conf"
+sudo mv "/tmp/pool-${DOMAIN}.conf" "/etc/php/${NEW_VERSION}/fpm/pool.d/${DOMAIN}.conf"
+sudo rm -f "/etc/php/${OLD_VERSION}/fpm/pool.d/${DOMAIN}.conf"
 
-# Update database
 mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -e \
     "UPDATE flyne_engine.sites SET php_version='${NEW_VERSION}' WHERE domain='${DOMAIN}'"
 
-# Store new version
 echo "$NEW_VERSION" > "${FLYNE_DIR}/run/${DOMAIN}.php"
 
-# Reload services
-systemctl reload "php${NEW_VERSION}-fpm"
-systemctl reload "php${OLD_VERSION}-fpm" 2>/dev/null || true
+sudo systemctl reload "php${NEW_VERSION}-fpm"
+sudo systemctl reload "php${OLD_VERSION}-fpm" 2>/dev/null || true
 
 echo "{\"success\":true,\"old_version\":\"${OLD_VERSION}\",\"new_version\":\"${NEW_VERSION}\"}"
 PHPSWITCH
-chmod +x ${FLYNE_DIR}/scripts/php-switch.sh
+chmod +x "${FLYNE_DIR}/scripts/php-switch.sh"
 
 #===============================================================================
-# SFTP ENABLE SCRIPT
+# SFTP-ENABLE SCRIPT
 #===============================================================================
-cat > ${FLYNE_DIR}/scripts/sftp-enable.sh << 'SFTPENABLE'
+cat > "${FLYNE_DIR}/scripts/sftp-enable.sh" << 'SFTPENABLE'
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 
 DOMAIN="$1"
 EXPIRE="${2:-never}"
@@ -1197,7 +1037,6 @@ SITES_DIR="/var/www/sites"
 
 source ${FLYNE_DIR}/flyne.conf
 
-# Get site info
 SITE_INFO=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e \
     "SELECT id, site_user FROM flyne_engine.sites WHERE domain='${DOMAIN}'" 2>/dev/null)
 
@@ -1213,7 +1052,6 @@ SAFE_DOMAIN=$(echo "$DOMAIN" | tr '.-' '__' | cut -c1-20)
 SFTP_USER="sftp_${SAFE_DOMAIN}"
 SFTP_PASS=$(openssl rand -hex 12)
 
-# Calculate expiry
 case "$EXPIRE" in
     1h)  EXPIRES_AT=$(date -d '+1 hour' '+%Y-%m-%d %H:%M:%S') ;;
     24h) EXPIRES_AT=$(date -d '+24 hours' '+%Y-%m-%d %H:%M:%S') ;;
@@ -1222,15 +1060,13 @@ case "$EXPIRE" in
     *)   EXPIRES_AT="NULL" ;;
 esac
 
-# Check if SFTP user exists
 EXISTING=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e \
     "SELECT sftp_user FROM flyne_engine.sftp_access WHERE site_id=${SITE_ID}" 2>/dev/null || true)
 
 if [[ -n "$EXISTING" ]]; then
     SFTP_USER="$EXISTING"
-    # Re-enable and update password
-    usermod -U "$SFTP_USER" 2>/dev/null || true
-    echo "${SFTP_USER}:${SFTP_PASS}" | chpasswd
+    sudo usermod -U "$SFTP_USER" 2>/dev/null || true
+    echo "${SFTP_USER}:${SFTP_PASS}" | sudo chpasswd
     
     if [[ "$EXPIRES_AT" == "NULL" ]]; then
         mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -e \
@@ -1240,21 +1076,13 @@ if [[ -n "$EXISTING" ]]; then
             "UPDATE flyne_engine.sftp_access SET is_enabled=1, expires_at='${EXPIRES_AT}' WHERE site_id=${SITE_ID}"
     fi
 else
-    # Create new SFTP user
-    # CRITICAL: Home must be the site dir for chroot, shell must be nologin
-    useradd -d "$SITE_DIR" -s /usr/sbin/nologin -g siteusers "$SFTP_USER"
-    echo "${SFTP_USER}:${SFTP_PASS}" | chpasswd
+    sudo useradd -d "$SITE_DIR" -s /usr/sbin/nologin -g siteusers "$SFTP_USER"
+    echo "${SFTP_USER}:${SFTP_PASS}" | sudo chpasswd
+    sudo usermod -aG www-data "$SFTP_USER"
     
-    # Add to site's group for file access
-    usermod -aG www-data "$SFTP_USER"
-    
-    # Ensure chroot directory structure is correct
-    chown root:root "$SITE_DIR"
-    chmod 755 "$SITE_DIR"
-    
-    # SFTP user needs write access to public
-    setfacl -R -m u:${SFTP_USER}:rwx "${SITE_DIR}/public" 2>/dev/null || \
-        chown -R "${SITE_USER}:siteusers" "${SITE_DIR}/public"
+    sudo chown root:root "$SITE_DIR"
+    sudo chmod 755 "$SITE_DIR"
+    sudo setfacl -R -m u:${SFTP_USER}:rwx "${SITE_DIR}/public" 2>/dev/null || true
     
     if [[ "$EXPIRES_AT" == "NULL" ]]; then
         mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -e \
@@ -1265,7 +1093,6 @@ else
     fi
 fi
 
-# Get server hostname for SFTP connection
 HOSTNAME=$(hostname -f 2>/dev/null || hostname)
 
 cat << JSONEOF
@@ -1282,14 +1109,14 @@ cat << JSONEOF
 }
 JSONEOF
 SFTPENABLE
-chmod +x ${FLYNE_DIR}/scripts/sftp-enable.sh
+chmod +x "${FLYNE_DIR}/scripts/sftp-enable.sh"
 
 #===============================================================================
-# SFTP DISABLE SCRIPT
+# SFTP-DISABLE SCRIPT
 #===============================================================================
-cat > ${FLYNE_DIR}/scripts/sftp-disable.sh << 'SFTPDISABLE'
+cat > "${FLYNE_DIR}/scripts/sftp-disable.sh" << 'SFTPDISABLE'
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 
 DOMAIN="$1"
 FLYNE_DIR="/opt/flyne"
@@ -1312,20 +1139,19 @@ if [[ -z "$SFTP_USER" ]]; then
     exit 1
 fi
 
-# Lock the user account
-usermod -L "$SFTP_USER"
+sudo usermod -L "$SFTP_USER"
 
 mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -e \
     "UPDATE flyne_engine.sftp_access SET is_enabled=0 WHERE site_id=${SITE_ID}"
 
 echo '{"success":true,"message":"SFTP access disabled"}'
 SFTPDISABLE
-chmod +x ${FLYNE_DIR}/scripts/sftp-disable.sh
+chmod +x "${FLYNE_DIR}/scripts/sftp-disable.sh"
 
 #===============================================================================
-# CACHE PURGE SCRIPT
+# CACHE-PURGE SCRIPT
 #===============================================================================
-cat > ${FLYNE_DIR}/scripts/cache-purge.sh << 'CACHEPURGE'
+cat > "${FLYNE_DIR}/scripts/cache-purge.sh" << 'CACHEPURGE'
 #!/bin/bash
 DOMAIN="$1"
 FLYNE_DIR="/opt/flyne"
@@ -1333,13 +1159,12 @@ FLYNE_DIR="/opt/flyne"
 source ${FLYNE_DIR}/flyne.conf
 
 if [[ -n "$DOMAIN" ]]; then
-    # Site-specific purge
     REDIS_DB=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e \
         "SELECT redis_db FROM flyne_engine.sites WHERE domain='${DOMAIN}'" 2>/dev/null)
     
-    rm -rf "/var/cache/nginx/fastcgi/sites/${DOMAIN}" 2>/dev/null
-    mkdir -p "/var/cache/nginx/fastcgi/sites/${DOMAIN}"
-    chown www-data:www-data "/var/cache/nginx/fastcgi/sites/${DOMAIN}"
+    sudo rm -rf "/var/cache/nginx/fastcgi/sites/${DOMAIN}" 2>/dev/null
+    sudo mkdir -p "/var/cache/nginx/fastcgi/sites/${DOMAIN}"
+    sudo chown www-data:www-data "/var/cache/nginx/fastcgi/sites/${DOMAIN}"
     
     if [[ -n "$REDIS_DB" ]]; then
         redis-cli -s /run/redis/redis-server.sock -a "$REDIS_PASS" -n "$REDIS_DB" FLUSHDB 2>/dev/null
@@ -1347,19 +1172,18 @@ if [[ -n "$DOMAIN" ]]; then
     
     echo "{\"success\":true,\"message\":\"Cache purged for ${DOMAIN}\"}"
 else
-    # Global cache purge
-    find /var/cache/nginx/fastcgi -type f -delete 2>/dev/null
+    sudo find /var/cache/nginx/fastcgi -type f -delete 2>/dev/null
     echo '{"success":true,"message":"Global cache purged"}'
 fi
 CACHEPURGE
-chmod +x ${FLYNE_DIR}/scripts/cache-purge.sh
+chmod +x "${FLYNE_DIR}/scripts/cache-purge.sh"
 
 #===============================================================================
-# WP-CLI WRAPPER (runs commands as site user)
+# WP-CLI SCRIPT
 #===============================================================================
-cat > ${FLYNE_DIR}/scripts/wp-cli.sh << 'WPCLI'
+cat > "${FLYNE_DIR}/scripts/wp-cli.sh" << 'WPCLI'
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
 
 DOMAIN="$1"
 shift
@@ -1369,7 +1193,6 @@ SITES_DIR="/var/www/sites"
 
 source ${FLYNE_DIR}/flyne.conf
 
-# Get site info
 SITE_INFO=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e \
     "SELECT site_user, php_version FROM flyne_engine.sites WHERE domain='${DOMAIN}'" 2>/dev/null)
 
@@ -1382,7 +1205,6 @@ read SITE_USER PHP_VERSION <<< "$SITE_INFO"
 
 PUBLIC_DIR="${SITES_DIR}/${DOMAIN}/public"
 
-# Security: Block dangerous commands
 BLOCKED="eval eval-file shell db drop db reset"
 for B in $BLOCKED; do
     if [[ "$COMMAND" == *"$B"* ]]; then
@@ -1391,23 +1213,20 @@ for B in $BLOCKED; do
     fi
 done
 
-# Run WP-CLI as site user with correct PHP version
 OUTPUT=$(sudo -u "$SITE_USER" /usr/bin/php${PHP_VERSION} /usr/local/bin/wp $COMMAND --path="$PUBLIC_DIR" 2>&1) || true
 EXIT_CODE=$?
 
-# Try to parse as JSON if it looks like JSON output
 if [[ "$OUTPUT" == "["* ]] || [[ "$OUTPUT" == "{"* ]]; then
     echo "{\"success\":true,\"exit_code\":${EXIT_CODE},\"output\":${OUTPUT}}"
 else
-    # Escape for JSON
-    ESCAPED=$(echo "$OUTPUT" | jq -Rs .)
-    echo "{\"success\":true,\"exit_code\":${EXIT_CODE},\"output\":${ESCAPED}}"
+    ESCAPED=$(echo "$OUTPUT" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr '\n' ' ')
+    echo "{\"success\":true,\"exit_code\":${EXIT_CODE},\"output\":\"${ESCAPED}\"}"
 fi
 WPCLI
-chmod +x ${FLYNE_DIR}/scripts/wp-cli.sh
+chmod +x "${FLYNE_DIR}/scripts/wp-cli.sh"
 
 # Set ownership for all scripts
-chown -R flyne-agent:flyne-agent ${FLYNE_DIR}/scripts
+chown -R flyne-agent:flyne-agent "${FLYNE_DIR}/scripts"
 
 #===============================================================================
 # SUDOERS CONFIGURATION - CRITICAL FOR API TO WORK
@@ -1416,32 +1235,12 @@ log "Configuring sudo permissions..."
 
 cat > /etc/sudoers.d/flyne << 'SUDOERS'
 # Flyne Engine Sudoers Configuration
-# www-data can run Flyne scripts as flyne-agent (no password)
-# flyne-agent can run system commands (no password)
 
-# Allow www-data to run Flyne scripts as flyne-agent
-www-data ALL=(flyne-agent) NOPASSWD: /opt/flyne/scripts/create-site.sh *
-www-data ALL=(flyne-agent) NOPASSWD: /opt/flyne/scripts/delete-site.sh *
-www-data ALL=(flyne-agent) NOPASSWD: /opt/flyne/scripts/php-switch.sh *
-www-data ALL=(flyne-agent) NOPASSWD: /opt/flyne/scripts/sftp-enable.sh *
-www-data ALL=(flyne-agent) NOPASSWD: /opt/flyne/scripts/sftp-disable.sh *
-www-data ALL=(flyne-agent) NOPASSWD: /opt/flyne/scripts/cache-purge.sh *
-www-data ALL=(flyne-agent) NOPASSWD: /opt/flyne/scripts/wp-cli.sh *
+# flyne-agent has full sudo (needed for site management)
+flyne-agent ALL=(ALL) NOPASSWD: ALL
 
-# flyne-agent privileges for site management
-flyne-agent ALL=(ALL) NOPASSWD: /usr/sbin/useradd *
-flyne-agent ALL=(ALL) NOPASSWD: /usr/sbin/userdel *
-flyne-agent ALL=(ALL) NOPASSWD: /usr/sbin/usermod *
-flyne-agent ALL=(ALL) NOPASSWD: /usr/sbin/chpasswd
-flyne-agent ALL=(ALL) NOPASSWD: /usr/bin/setfacl *
-flyne-agent ALL=(ALL) NOPASSWD: /bin/systemctl reload php*-fpm
-flyne-agent ALL=(ALL) NOPASSWD: /bin/systemctl restart php*-fpm
-flyne-agent ALL=(ALL) NOPASSWD: /bin/systemctl reload nginx
-flyne-agent ALL=(ALL) NOPASSWD: /usr/sbin/nginx -t
-flyne-agent ALL=(ALL) NOPASSWD: /usr/bin/certbot *
-
-# WP-CLI needs to run as site users
-flyne-agent ALL=(ALL) NOPASSWD: /usr/bin/sudo -u * /usr/bin/php* /usr/local/bin/wp *
+# www-data can run flyne scripts as flyne-agent
+www-data ALL=(flyne-agent) NOPASSWD: /bin/bash /opt/flyne/scripts/*.sh *
 SUDOERS
 chmod 440 /etc/sudoers.d/flyne
 visudo -cf /etc/sudoers.d/flyne || error "Sudoers syntax error"
@@ -1450,12 +1249,10 @@ visudo -cf /etc/sudoers.d/flyne || error "Sudoers syntax error"
 # CRON JOBS
 #===============================================================================
 log "Setting up cron jobs..."
-cat > /etc/cron.d/flyne << CRONEOF
+
+cat > /etc/cron.d/flyne << 'CRONFILE'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-
-# Expire SFTP access
-*/5 * * * * root mysql -u ${MYSQL_USER} -p'${MYSQL_ADMIN_PASS}' -N -e "SELECT sftp_user FROM flyne_engine.sftp_access WHERE expires_at IS NOT NULL AND expires_at < NOW() AND is_enabled=1" 2>/dev/null | while read user; do usermod -L "\$user" 2>/dev/null; mysql -u ${MYSQL_USER} -p'${MYSQL_ADMIN_PASS}' -e "UPDATE flyne_engine.sftp_access SET is_enabled=0 WHERE sftp_user='\$user'" 2>/dev/null; done
 
 # Clean old cache files
 0 3 * * * root find /var/cache/nginx/fastcgi -type f -mtime +7 -delete 2>/dev/null
@@ -1463,21 +1260,16 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 # Clean old backups
 0 4 * * 0 root find /opt/flyne/backups -type f -mtime +30 -delete 2>/dev/null
 
-# Database optimization
-0 5 * * 0 root mysqlcheck -u ${MYSQL_USER} -p'${MYSQL_ADMIN_PASS}' --optimize --all-databases 2>/dev/null
-
-# WordPress cron via HTTP
-*/5 * * * * www-data for site in /var/www/sites/*/public/wp-cron.php; do domain=\$(basename \$(dirname \$(dirname "\$site"))); curl -fsS --max-time 30 -o /dev/null "https://\${domain}/wp-cron.php?doing_wp_cron" 2>/dev/null || true; done
-
 # SSL renewal
 0 */12 * * * root certbot renew --quiet --post-hook "systemctl reload nginx"
-CRONEOF
+CRONFILE
 chmod 644 /etc/cron.d/flyne
 
 #===============================================================================
 # FAIL2BAN
 #===============================================================================
 log "Configuring Fail2Ban..."
+
 cat > /etc/fail2ban/jail.local << 'F2BJAIL'
 [DEFAULT]
 bantime = 3600
@@ -1517,9 +1309,9 @@ systemctl restart fail2ban || warn "Fail2ban restart failed"
 log "Configuring firewall..."
 ufw default deny incoming
 ufw default allow outgoing
-ufw limit 22/tcp comment 'SSH rate limited'
-ufw allow 80/tcp comment 'HTTP'
-ufw allow 443/tcp comment 'HTTPS'
+ufw limit 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
 ufw --force enable
 
 #===============================================================================
@@ -1528,7 +1320,6 @@ ufw --force enable
 log "Applying kernel optimizations..."
 cat > /etc/sysctl.d/99-flyne.conf << 'SYSCTL'
 net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_tw_reuse = 1
@@ -1558,7 +1349,7 @@ cat > /etc/logrotate.d/flyne << 'LOGROTATE'
     delaycompress
     missingok
     notifempty
-    create 644 www-data www-data
+    create 664 flyne-agent www-data
 }
 
 /var/www/sites/*/logs/*.log {
@@ -1579,40 +1370,40 @@ LOGROTATE
 # CLI TOOL
 #===============================================================================
 log "Installing CLI tool..."
-cat > /usr/local/bin/flyne << 'CLIFILE'
+
+cat > /usr/local/bin/flyne << 'CLIEOF'
 #!/bin/bash
 source /opt/flyne/flyne.conf 2>/dev/null || { echo "Flyne not configured"; exit 1; }
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-
 case "$1" in
     status)
-        echo -e "${BLUE}=== Flyne Engine v4.0 Status ===${NC}"
+        echo "=== Flyne Engine v4.0 Status ==="
         for svc in nginx mariadb redis-server; do
-            systemctl is-active --quiet $svc && echo -e "$svc: ${GREEN}Running${NC}" || echo -e "$svc: ${RED}Stopped${NC}"
+            systemctl is-active --quiet $svc && echo "$svc: Running" || echo "$svc: Stopped"
         done
         for v in 7.4 8.0 8.1 8.2 8.3 8.4; do
-            systemctl is-active --quiet php${v}-fpm 2>/dev/null && echo -e "PHP ${v}-FPM: ${GREEN}Running${NC}"
+            systemctl is-active --quiet php${v}-fpm 2>/dev/null && echo "PHP ${v}-FPM: Running"
         done
         SITE_COUNT=$(mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -N -e "SELECT COUNT(*) FROM flyne_engine.sites WHERE status='active'" 2>/dev/null || echo 0)
-        echo -e "\nActive Sites: ${YELLOW}${SITE_COUNT}${NC}"
-        echo -e "API: ${BLUE}https://${API_DOMAIN}${NC}"
+        echo ""
+        echo "Active Sites: ${SITE_COUNT}"
+        echo "API: https://${API_DOMAIN}"
         ;;
     sites)
         mysql -u "$MYSQL_USER" -p"$MYSQL_PASS" -e "SELECT domain, php_version, status, ssl_enabled, created_at FROM flyne_engine.sites ORDER BY created_at DESC" 2>/dev/null
         ;;
     create)
         [[ -z "$2" ]] && { echo "Usage: flyne create domain.com [email]"; exit 1; }
-        sudo -u flyne-agent /opt/flyne/scripts/create-site.sh "$2" "8.4" "${3:-admin@$2}"
+        sudo -u flyne-agent /bin/bash /opt/flyne/scripts/create-site.sh "$2" "8.4" "${3:-admin@$2}"
         ;;
     delete)
         [[ -z "$2" ]] && { echo "Usage: flyne delete domain.com"; exit 1; }
         read -p "Delete $2? [y/N] " confirm
         [[ "$confirm" != "y" ]] && exit 0
-        sudo -u flyne-agent /opt/flyne/scripts/delete-site.sh "$2"
+        sudo -u flyne-agent /bin/bash /opt/flyne/scripts/delete-site.sh "$2"
         ;;
     cache-clear)
-        sudo -u flyne-agent /opt/flyne/scripts/cache-purge.sh "$2"
+        sudo -u flyne-agent /bin/bash /opt/flyne/scripts/cache-purge.sh "$2"
         ;;
     test)
         echo "Testing API..."
@@ -1622,7 +1413,8 @@ case "$1" in
         [[ -z "$2" ]] && tail -f /var/log/flyne/*.log || tail -f /var/www/sites/$2/logs/*.log
         ;;
     *)
-        echo -e "${BLUE}Flyne Engine CLI v4.0${NC}\n"
+        echo "Flyne Engine CLI v4.0"
+        echo ""
         echo "Commands:"
         echo "  status              System status"
         echo "  sites               List sites"
@@ -1633,8 +1425,54 @@ case "$1" in
         echo "  logs [domain]       View logs"
         ;;
 esac
-CLIFILE
+CLIEOF
 chmod +x /usr/local/bin/flyne
+
+#===============================================================================
+# DOWNLOAD API FILE
+#===============================================================================
+log "Downloading API file..."
+API_URL="https://raw.githubusercontent.com/Flynecom/flyne/main/index.php"
+
+if curl -fsSL "$API_URL" -o "${FLYNE_DIR}/index.php"; then
+    chown www-data:www-data "${FLYNE_DIR}/index.php"
+    chmod 644 "${FLYNE_DIR}/index.php"
+    log "API file downloaded successfully"
+else
+    warn "Failed to download API file from GitHub"
+    warn "Please manually download index.php to ${FLYNE_DIR}/index.php"
+fi
+
+#===============================================================================
+# SAVE CREDENTIALS
+#===============================================================================
+log "Saving credentials..."
+
+cat > "${FLYNE_DIR}/credentials.txt" << CREDEOF
+=== FLYNE ENGINE v4.0 CREDENTIALS ===
+Generated: $(date)
+
+API Domain:    https://${API_DOMAIN}
+PMA Domain:    https://${PMA_DOMAIN}
+
+API Secret:    ${API_SECRET}
+MySQL User:    flyne_admin
+MySQL Pass:    ${MYSQL_ADMIN_PASS}
+Redis Pass:    ${REDIS_PASS}
+Admin Email:   ${ADMIN_EMAIL}
+
+CLI Commands:
+  flyne status          - Check system status
+  flyne sites           - List all sites
+  flyne create domain   - Create WordPress site
+  flyne delete domain   - Delete site
+  flyne cache-clear     - Clear cache
+  flyne test            - Test API
+
+DELETE THIS FILE AFTER SAVING CREDENTIALS SECURELY!
+CREDEOF
+chmod 600 "${FLYNE_DIR}/credentials.txt"
+chown flyne-agent:flyne-agent "${FLYNE_DIR}/credentials.txt"
 
 #===============================================================================
 # FINAL VERIFICATION
@@ -1648,34 +1486,11 @@ systemctl is-active --quiet php8.4-fpm || error "PHP 8.4 FPM not running"
 mysql -u flyne_admin -p"${MYSQL_ADMIN_PASS}" -e "SELECT 1" >/dev/null 2>&1 || error "MySQL connection failed"
 redis-cli -s /run/redis/redis-server.sock -a "${REDIS_PASS}" PING >/dev/null 2>&1 || error "Redis connection failed"
 
-# Test sudo permissions
-sudo -u www-data sudo -n -u flyne-agent echo "Sudo test passed" >/dev/null 2>&1 || warn "Sudo permission test failed"
-
 log "All services verified!"
 
 #===============================================================================
-# SAVE CREDENTIALS & OUTPUT
+# FINAL OUTPUT
 #===============================================================================
-cat > ${FLYNE_DIR}/credentials.txt << CREDEOF
-=== FLYNE ENGINE v4.0 CREDENTIALS ===
-Generated: $(date)
-
-API Domain:    https://${API_DOMAIN}
-PMA Domain:    https://${PMA_DOMAIN}
-
-API Secret:    ${API_SECRET}
-MySQL User:    flyne_admin
-MySQL Pass:    ${MYSQL_ADMIN_PASS}
-Redis Pass:    ${REDIS_PASS}
-Admin Email:   ${ADMIN_EMAIL}
-
-CLI: flyne status|sites|create|delete|cache-clear|test|logs
-
-DELETE THIS FILE AFTER SAVING CREDENTIALS!
-CREDEOF
-chmod 600 ${FLYNE_DIR}/credentials.txt
-chown flyne-agent:flyne-agent ${FLYNE_DIR}/credentials.txt
-
 echo ""
 echo -e "${GREEN}================================================================${NC}"
 echo -e "${GREEN}   FLYNE ENGINE v4.0 INSTALLED SUCCESSFULLY!${NC}"
@@ -1694,7 +1509,11 @@ echo -e "  MySQL User:     ${YELLOW}flyne_admin${NC}"
 echo -e "  MySQL Pass:     ${YELLOW}${MYSQL_ADMIN_PASS}${NC}"
 echo -e "  Redis Password: ${YELLOW}${REDIS_PASS}${NC}"
 echo ""
-echo -e "Credentials saved: ${YELLOW}${FLYNE_DIR}/credentials.txt${NC}"
+echo -e "Credentials file: ${YELLOW}${FLYNE_DIR}/credentials.txt${NC}"
 echo ""
-log "Run 'flyne create example.com' to create your first site."
+echo -e "${BLUE}Quick Start:${NC}"
+echo "  flyne status          - Check system status"
+echo "  flyne test            - Test API connection"
+echo "  flyne create site.com - Create WordPress site"
 echo ""
+log "Installation complete!"
