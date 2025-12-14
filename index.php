@@ -1,8 +1,7 @@
 <?php
 /**
  * FLYNE ENGINE v4.0 - Production WordPress Hosting API
- * Complete rewrite with proper permission model
- * All operations delegated to flyne-agent via sudo
+ * Complete version with all endpoints
  */
 
 declare(strict_types=1);
@@ -12,7 +11,6 @@ ini_set('log_errors', '1');
 ini_set('error_log', '/var/log/flyne/api.log');
 set_time_limit(300);
 
-// Configuration from environment (set by Nginx)
 define('API_SECRET', $_SERVER['FLYNE_API_SECRET'] ?? '');
 define('MYSQL_USER', $_SERVER['FLYNE_MYSQL_USER'] ?? 'flyne_admin');
 define('MYSQL_PASS', $_SERVER['FLYNE_MYSQL_PASS'] ?? '');
@@ -56,7 +54,6 @@ function authenticate(): bool {
         return false;
     }
     
-    // Check Authorization header
     $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
     if (preg_match('/^Bearer\s+(.+)$/i', $auth, $matches)) {
         if (hash_equals(API_SECRET, $matches[1])) {
@@ -64,7 +61,6 @@ function authenticate(): bool {
         }
     }
     
-    // Check api_key parameter
     $key = $_POST['api_key'] ?? $_GET['api_key'] ?? '';
     if (!empty($key) && hash_equals(API_SECRET, $key)) {
         return true;
@@ -95,7 +91,7 @@ function apiError(string $message, int $code = 400): never {
 }
 
 //=============================================================================
-// SCRIPT EXECUTION (runs as flyne-agent via sudo)
+// SCRIPT EXECUTION
 //=============================================================================
 function runScript(string $script, array $args = []): array {
     $scriptPath = SCRIPTS_DIR . '/' . $script;
@@ -104,12 +100,10 @@ function runScript(string $script, array $args = []): array {
         return ['success' => false, 'error' => "Script not found: $script"];
     }
     
-    // Escape all arguments
     $escapedArgs = array_map('escapeshellarg', $args);
     $argString = implode(' ', $escapedArgs);
     
-    // Run as flyne-agent via sudo
-    $cmd = "sudo -u flyne-agent {$scriptPath} {$argString} 2>&1";
+    $cmd = "/usr/bin/sudo -u flyne-agent /bin/bash {$scriptPath} {$argString} 2>&1";
     
     $output = [];
     $exitCode = 0;
@@ -117,13 +111,11 @@ function runScript(string $script, array $args = []): array {
     
     $outputStr = implode("\n", $output);
     
-    // Try to parse JSON output from script
     $json = json_decode($outputStr, true);
     if (json_last_error() === JSON_ERROR_NONE && is_array($json)) {
         return $json;
     }
     
-    // Return raw output if not JSON
     return [
         'success' => $exitCode === 0,
         'output' => $outputStr,
@@ -144,16 +136,7 @@ function validateDomain(string $domain): bool {
     return (bool)preg_match('/^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$/i', $domain);
 }
 
-function getSitePhpVersion(string $domain): string {
-    $file = FLYNE_DIR . "/run/{$domain}.php";
-    if (file_exists($file)) {
-        return trim(file_get_contents($file));
-    }
-    $site = getSite($domain);
-    return $site['php_version'] ?? '8.4';
-}
-
-function logActivity(int $siteId, string $action, array $details = []): void {
+function logActivity(?int $siteId, string $action, array $details = []): void {
     try {
         $stmt = db()->prepare("INSERT INTO activity_logs (site_id, action, details, ip_address) VALUES (?, ?, ?, ?)");
         $stmt->execute([
@@ -176,7 +159,6 @@ function runWpCli(string $domain, string $command): array {
         apiError('Site not found');
     }
     
-    // Block dangerous commands
     $blocked = ['eval', 'eval-file', 'shell', 'db drop', 'db reset', 'db create'];
     foreach ($blocked as $b) {
         if (stripos($command, $b) !== false) {
@@ -184,7 +166,6 @@ function runWpCli(string $domain, string $command): array {
         }
     }
     
-    // Whitelist main commands
     $cmdParts = preg_split('/\s+/', trim($command));
     $mainCmd = $cmdParts[0] ?? '';
     $allowed = ['plugin', 'theme', 'cache', 'option', 'post', 'user', 'db', 'search-replace', 
@@ -195,9 +176,7 @@ function runWpCli(string $domain, string $command): array {
         apiError("Command not allowed: $mainCmd");
     }
     
-    $result = runScript('wp-cli.sh', [$domain, $command]);
-    
-    return $result;
+    return runScript('wp-cli.sh', [$domain, $command]);
 }
 
 //=============================================================================
@@ -309,7 +288,6 @@ try {
             $title = $_POST['title'] ?? $domain;
             $adminUser = $_POST['admin_user'] ?? 'admin';
             
-            // Validate PHP version
             $allowedPhp = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4'];
             if (!in_array($phpVersion, $allowedPhp)) {
                 apiError('Invalid PHP version. Allowed: ' . implode(', ', $allowedPhp));
@@ -318,6 +296,7 @@ try {
             $result = runScript('create-site.sh', [$domain, $phpVersion, $adminEmail, $title, $adminUser]);
             
             if (!empty($result['success']) && !empty($result['data'])) {
+                logActivity(null, 'site_created', ['domain' => $domain]);
                 apiSuccess($result['data'], 'Site created successfully');
             } elseif (!empty($result['error'])) {
                 apiError($result['error']);
@@ -331,13 +310,16 @@ try {
             if (empty($domain)) {
                 apiError('Domain required');
             }
-            if (!getSite($domain)) {
+            
+            $site = getSite($domain);
+            if (!$site) {
                 apiError('Site not found');
             }
             
             $result = runScript('delete-site.sh', [$domain]);
             
             if (!empty($result['success'])) {
+                logActivity(null, 'site_deleted', ['domain' => $domain]);
                 apiSuccess([], $result['message'] ?? 'Site deleted');
             } else {
                 apiError($result['error'] ?? 'Delete failed');
@@ -378,7 +360,6 @@ try {
                 apiError('Site not found');
             }
             
-            // Get disk usage
             $siteDir = SITES_DIR . "/{$domain}";
             $diskUsage = 0;
             if (is_dir($siteDir)) {
@@ -386,7 +367,6 @@ try {
                 $diskUsage = (int)($output[0] ?? 0);
             }
             
-            // Get SFTP status
             $stmt = db()->prepare("SELECT sftp_user, is_enabled, expires_at FROM sftp_access WHERE site_id = ?");
             $stmt->execute([$site['id']]);
             $sftp = $stmt->fetch();
@@ -394,7 +374,6 @@ try {
             $site['disk_usage_mb'] = $diskUsage;
             $site['sftp'] = $sftp ?: null;
             
-            // Remove sensitive data
             unset($site['db_pass']);
             
             apiSuccess(['site' => $site]);
@@ -412,7 +391,6 @@ try {
             
             $version = $_POST['version'] ?? '';
             if (empty($version)) {
-                // Just return current version
                 $site = getSite($domain);
                 if (!$site) apiError('Site not found');
                 apiSuccess(['php_version' => $site['php_version']]);
@@ -421,6 +399,7 @@ try {
             $result = runScript('php-switch.sh', [$domain, $version]);
             
             if (!empty($result['success'])) {
+                logActivity(null, 'php_switched', ['domain' => $domain, 'version' => $version]);
                 apiSuccess([
                     'old_version' => $result['old_version'] ?? null,
                     'new_version' => $result['new_version'] ?? $version
@@ -444,6 +423,8 @@ try {
             $result = runScript('sftp-enable.sh', [$domain, $expire]);
             
             if (!empty($result['success']) && !empty($result['data'])) {
+                $site = getSite($domain);
+                if ($site) logActivity($site['id'], 'sftp_enabled', ['expire' => $expire]);
                 apiSuccess($result['data'], 'SFTP access enabled');
             } else {
                 apiError($result['error'] ?? 'SFTP enable failed');
@@ -458,6 +439,8 @@ try {
             $result = runScript('sftp-disable.sh', [$domain]);
             
             if (!empty($result['success'])) {
+                $site = getSite($domain);
+                if ($site) logActivity($site['id'], 'sftp_disabled', []);
                 apiSuccess([], $result['message'] ?? 'SFTP access disabled');
             } else {
                 apiError($result['error'] ?? 'SFTP disable failed');
@@ -523,6 +506,10 @@ try {
             $result = runScript('cache-purge.sh', $domain ? [$domain] : []);
             
             if (!empty($result['success'])) {
+                if ($domain) {
+                    $site = getSite($domain);
+                    if ($site) logActivity($site['id'], 'cache_flushed', []);
+                }
                 apiSuccess([], $result['message'] ?? 'Cache purged');
             } else {
                 apiError($result['error'] ?? 'Cache purge failed');
@@ -561,11 +548,11 @@ try {
             $result = runWpCli($domain, 'plugin list --format=json');
             $plugins = [];
             
-            if (!empty($result['output'])) {
-                $decoded = json_decode($result['output'], true);
+            $output = $result['output'] ?? '';
+            if (is_string($output) && !empty($output)) {
+                $decoded = json_decode($output, true);
                 if (is_array($decoded)) {
                     $plugins = $decoded;
-                    // Add icon URLs
                     foreach ($plugins as &$plugin) {
                         $slug = $plugin['name'] ?? '';
                         if ($slug) {
@@ -721,11 +708,11 @@ try {
             $result = runWpCli($domain, 'theme list --format=json');
             $themes = [];
             
-            if (!empty($result['output'])) {
-                $decoded = json_decode($result['output'], true);
+            $output = $result['output'] ?? '';
+            if (is_string($output) && !empty($output)) {
+                $decoded = json_decode($output, true);
                 if (is_array($decoded)) {
                     $themes = $decoded;
-                    // Add screenshot URLs
                     foreach ($themes as &$theme) {
                         $themeName = $theme['name'] ?? '';
                         $themePath = SITES_DIR . "/{$domain}/public/wp-content/themes/{$themeName}";
@@ -870,8 +857,9 @@ try {
             $result = runWpCli($domain, 'user list --format=json');
             $users = [];
             
-            if (!empty($result['output'])) {
-                $decoded = json_decode($result['output'], true);
+            $output = $result['output'] ?? '';
+            if (is_string($output) && !empty($output)) {
+                $decoded = json_decode($output, true);
                 if (is_array($decoded)) {
                     $users = $decoded;
                 }
@@ -1017,8 +1005,9 @@ try {
             $result = runWpCli($domain, 'core check-update --format=json');
             $updates = [];
             
-            if (!empty($result['output'])) {
-                $decoded = json_decode($result['output'], true);
+            $output = $result['output'] ?? '';
+            if (is_string($output) && !empty($output)) {
+                $decoded = json_decode($output, true);
                 if (is_array($decoded)) {
                     $updates = $decoded;
                 }
@@ -1123,8 +1112,7 @@ try {
             
             $email = $_POST['email'] ?? $site['wp_admin_email'] ?? "admin@{$domain}";
             
-            // Run certbot via script
-            $cmd = "sudo -u flyne-agent sudo /usr/bin/certbot --nginx -d {$domain} --non-interactive --agree-tos --email {$email} --redirect 2>&1";
+            $cmd = "/usr/bin/sudo -u flyne-agent sudo /usr/bin/certbot --nginx -d {$domain} --non-interactive --agree-tos --email {$email} --redirect 2>&1";
             exec($cmd, $output, $exitCode);
             
             if ($exitCode === 0) {
@@ -1146,11 +1134,10 @@ try {
                 apiError('Site not found');
             }
             
-            // Check certificate expiry
             $expiry = null;
             $certFile = "/etc/letsencrypt/live/{$domain}/cert.pem";
             if (file_exists($certFile)) {
-                $certData = openssl_x509_parse(file_get_contents($certFile));
+                $certData = @openssl_x509_parse(@file_get_contents($certFile));
                 if ($certData && isset($certData['validTo_time_t'])) {
                     $expiry = date('Y-m-d H:i:s', $certData['validTo_time_t']);
                 }
@@ -1178,11 +1165,9 @@ try {
             
             $siteDir = SITES_DIR . "/{$domain}";
             
-            // Get total usage
             exec("du -sm " . escapeshellarg($siteDir) . " | cut -f1", $output);
             $total = (int)($output[0] ?? 0);
             
-            // Get breakdown
             $breakdown = [];
             $subdirs = ['public', 'logs', 'tmp'];
             foreach ($subdirs as $subdir) {
@@ -1194,7 +1179,6 @@ try {
                 }
             }
             
-            // Get uploads specifically
             $uploadsPath = "{$siteDir}/public/wp-content/uploads";
             if (is_dir($uploadsPath)) {
                 unset($output);
@@ -1297,7 +1281,6 @@ try {
             
             $checks = [];
             
-            // Check if site responds
             $ch = curl_init("https://{$domain}/");
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
@@ -1314,18 +1297,16 @@ try {
             $checks['response_time_ms'] = round($loadTime * 1000);
             $checks['is_up'] = $httpCode >= 200 && $httpCode < 400;
             
-            // Check PHP-FPM socket
             $domainHash = substr(sha1($domain), 0, 12);
             $socket = "/run/php/site-{$domainHash}.sock";
             $checks['php_fpm_socket'] = file_exists($socket);
             
-            // Get WP version
             $wpVersion = runWpCli($domain, 'core version');
             $checks['wordpress_version'] = trim($wpVersion['output'] ?? '');
             
-            // Check for updates
             $updateCheck = runWpCli($domain, 'core check-update --format=json');
-            $checks['core_update_available'] = !empty($updateCheck['output']) && $updateCheck['output'] !== '[]';
+            $output = $updateCheck['output'] ?? '';
+            $checks['core_update_available'] = is_string($output) && !empty($output) && $output !== '[]';
             
             apiSuccess(['health' => $checks]);
             break;
@@ -1365,7 +1346,6 @@ try {
             $stmt->execute($params);
             $logs = $stmt->fetchAll();
             
-            // Parse JSON details
             foreach ($logs as &$log) {
                 if (!empty($log['details'])) {
                     $log['details'] = json_decode($log['details'], true);
@@ -1376,60 +1356,61 @@ try {
             break;
             
         //=====================================================================
-        // SYSTEM STATUS (for admin panel)
+        // SYSTEM STATUS
         //=====================================================================
         
         case 'system_status':
-            // Get server info
             $info = [
-                'hostname' => gethostname(),
+                'hostname' => gethostname() ?: 'unknown',
                 'php_version' => PHP_VERSION,
                 'api_version' => '4.0'
             ];
             
-            // Memory usage
-            $memInfo = file_get_contents('/proc/meminfo');
-            if (preg_match('/MemTotal:\s+(\d+)/', $memInfo, $m)) {
-                $info['memory_total_mb'] = round($m[1] / 1024);
+            exec('free -m', $memOutput);
+            if (isset($memOutput[1])) {
+                $memParts = preg_split('/\s+/', $memOutput[1]);
+                $info['memory_total_mb'] = (int)($memParts[1] ?? 0);
+                $info['memory_used_mb'] = (int)($memParts[2] ?? 0);
+                $info['memory_available_mb'] = (int)($memParts[6] ?? $memParts[3] ?? 0);
             }
-            if (preg_match('/MemAvailable:\s+(\d+)/', $memInfo, $m)) {
-                $info['memory_available_mb'] = round($m[1] / 1024);
+            
+            $info['disk_total_gb'] = round(@disk_total_space('/') / 1073741824, 1);
+            $info['disk_free_gb'] = round(@disk_free_space('/') / 1073741824, 1);
+            
+            exec('uptime', $uptimeOutput);
+            if (!empty($uptimeOutput[0]) && preg_match('/load average:\s*([\d.]+),?\s*([\d.]+),?\s*([\d.]+)/', $uptimeOutput[0], $loadMatch)) {
+                $info['load_average'] = [(float)$loadMatch[1], (float)$loadMatch[2], (float)$loadMatch[3]];
+            } else {
+                $info['load_average'] = [0, 0, 0];
             }
             
-            // Disk usage
-            $info['disk_total_gb'] = round(disk_total_space('/') / 1073741824, 1);
-            $info['disk_free_gb'] = round(disk_free_space('/') / 1073741824, 1);
-            
-            // Load average
-            $load = sys_getloadavg();
-            $info['load_average'] = $load;
-            
-            // Site counts
-            $counts = db()->query("SELECT status, COUNT(*) as count FROM sites GROUP BY status")->fetchAll();
-            $info['sites'] = [];
-            foreach ($counts as $row) {
-                $info['sites'][$row['status']] = (int)$row['count'];
+            try {
+                $counts = db()->query("SELECT status, COUNT(*) as count FROM sites GROUP BY status")->fetchAll();
+                $info['sites'] = [];
+                foreach ($counts as $row) {
+                    $info['sites'][$row['status']] = (int)$row['count'];
+                }
+                $info['sites']['total'] = array_sum($info['sites']);
+            } catch (Exception $e) {
+                $info['sites'] = ['total' => 0];
             }
-            $info['sites']['total'] = array_sum($info['sites']);
             
-            // Service status
             $services = ['nginx', 'mariadb', 'redis-server'];
             $info['services'] = [];
             foreach ($services as $svc) {
-                exec("systemctl is-active {$svc} 2>/dev/null", $output, $code);
-                $info['services'][$svc] = $code === 0 ? 'running' : 'stopped';
-                unset($output);
+                exec("systemctl is-active {$svc} 2>/dev/null", $svcOutput, $svcCode);
+                $info['services'][$svc] = $svcCode === 0 ? 'running' : 'stopped';
+                unset($svcOutput);
             }
             
-            // PHP-FPM pools
             $phpVersions = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4'];
             $info['php_fpm'] = [];
             foreach ($phpVersions as $v) {
-                exec("systemctl is-active php{$v}-fpm 2>/dev/null", $output, $code);
-                if ($code === 0) {
+                exec("systemctl is-active php{$v}-fpm 2>/dev/null", $phpOutput, $phpCode);
+                if ($phpCode === 0) {
                     $info['php_fpm'][$v] = 'running';
                 }
-                unset($output);
+                unset($phpOutput);
             }
             
             apiSuccess($info);
