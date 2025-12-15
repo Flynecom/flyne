@@ -540,19 +540,21 @@ try {
         //=====================================================================
         
         case 'plugin_list':
-        case 'wp_plugin_list':
-            if (empty($domain)) {
-                apiError('Domain required');
-            }
-            
-            $result = runWpCli($domain, 'plugin list --format=json');
-            $plugins = [];
-            
-            $output = $result['output'] ?? '';
-            if (is_string($output) && !empty($output)) {
-                $decoded = json_decode($output, true);
-                if (is_array($decoded)) {
-                    $plugins = $decoded;
+            case 'wp_plugin_list':
+                if (empty($domain)) {
+                    apiError('Domain required');
+                }
+                
+                $result = runWpCli($domain, 'plugin list --format=json');
+                $plugins = [];
+                
+                $output = $result['output'] ?? '';
+                if (is_array($output)) {
+                    $plugins = $output;
+                } elseif (is_string($output) && !empty($output)) {
+                    $decoded = json_decode($output, true);
+                    if (is_array($decoded)) {
+                        $plugins = $decoded;
                     foreach ($plugins as &$plugin) {
                         $slug = $plugin['name'] ?? '';
                         if ($slug) {
@@ -700,19 +702,21 @@ try {
         //=====================================================================
         
         case 'theme_list':
-        case 'wp_theme_list':
-            if (empty($domain)) {
-                apiError('Domain required');
-            }
-            
-            $result = runWpCli($domain, 'theme list --format=json');
-            $themes = [];
-            
-            $output = $result['output'] ?? '';
-            if (is_string($output) && !empty($output)) {
-                $decoded = json_decode($output, true);
-                if (is_array($decoded)) {
-                    $themes = $decoded;
+            case 'wp_theme_list':
+                if (empty($domain)) {
+                    apiError('Domain required');
+                }
+                
+                $result = runWpCli($domain, 'theme list --format=json');
+                $themes = [];
+                
+                $output = $result['output'] ?? '';
+                if (is_array($output)) {
+                    $themes = $output;
+                } elseif (is_string($output) && !empty($output)) {
+                    $decoded = json_decode($output, true);
+                    if (is_array($decoded)) {
+                        $themes = $decoded;
                     foreach ($themes as &$theme) {
                         $themeName = $theme['name'] ?? '';
                         $themePath = SITES_DIR . "/{$domain}/public/wp-content/themes/{$themeName}";
@@ -849,21 +853,23 @@ try {
         //=====================================================================
         
         case 'user_list':
-        case 'wp_user_list':
-            if (empty($domain)) {
-                apiError('Domain required');
-            }
-            
-            $result = runWpCli($domain, 'user list --format=json');
-            $users = [];
-            
-            $output = $result['output'] ?? '';
-            if (is_string($output) && !empty($output)) {
-                $decoded = json_decode($output, true);
-                if (is_array($decoded)) {
-                    $users = $decoded;
+            case 'wp_user_list':
+                if (empty($domain)) {
+                    apiError('Domain required');
                 }
-            }
+                
+                $result = runWpCli($domain, 'user list --format=json');
+                $users = [];
+                
+                $output = $result['output'] ?? '';
+                if (is_array($output)) {
+                    $users = $output;
+                } elseif (is_string($output) && !empty($output)) {
+                    $decoded = json_decode($output, true);
+                    if (is_array($decoded)) {
+                        $users = $decoded;
+                    }
+                }
             
             apiSuccess(['users' => $users]);
             break;
