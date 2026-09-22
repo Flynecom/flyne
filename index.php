@@ -335,6 +335,149 @@ function runWpCommand(string $domain, string $command): array {
 }
 
 //=============================================================================
+// LOG PARSERS - raw log lines -> the structured entries the panel renders
+//=============================================================================
+function fmtNginxTime(string $t): string {
+    $d = DateTime::createFromFormat('d/M/Y:H:i:s O', $t);
+    return $d ? $d->format('Y-m-d H:i:s') : $t;
+}
+function fmtPhpTime(string $t): string {
+    $d = DateTime::createFromFormat('d-M-Y H:i:s', $t);
+    return $d ? $d->format('Y-m-d H:i:s') : $t;
+}
+
+/** "flyne" access format: ip - user [time] "request" status bytes "referer" "ua" rt=.. urt=.. cache=.. */
+function parseAccessLine(string $l): ?array {
+    $q = '"((?:[^"\\\\]|\\\\.)*)"';
+    if (!preg_match('/^(\S+) \S+ (\S+) \[([^\]]+)\] ' . $q . ' (\d{3}) (\d+|-) ' . $q . ' ' . $q . '(.*)$/', $l, $m)) {
+        return null;
+    }
+    $req = explode(' ', $m[4], 3);
+    $hasReq = count($req) >= 2;
+    $rt = preg_match('/\brt=([\d.]+)/', $m[9], $x) ? (float)$x[1] : null;
+    $cache = preg_match('/\bcache=(\S+)/', $m[9], $x) ? $x[1] : '-';
+    return [
+        'timestamp'     => fmtNginxTime($m[3]),
+        'ip'            => $m[1],
+        'user'          => $m[2] === '-' ? null : $m[2],
+        'method'        => $hasReq ? $req[0] : '-',
+        'uri'           => $hasReq ? $req[1] : $m[4],
+        'protocol'      => $req[2] ?? null,
+        'status'        => (int)$m[5],
+        'bytes'         => $m[6] === '-' ? 0 : (int)$m[6],
+        'referer'       => $m[7] === '-' ? null : $m[7],
+        'user_agent'    => $m[8] === '-' ? null : $m[8],
+        'response_time' => $rt,
+        'cache'         => $cache === '-' ? null : $cache,
+    ];
+}
+
+/** nginx error log: 2026/09/22 18:30:00 [error] 12#12: *5 message, client: 1.2.3.4, server: x, request: "GET / HTTP/1.1" */
+function parseNginxErrorLine(string $l): ?array {
+    if (!preg_match('/^(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] \d+#\d+: (?:\*\d+ )?(.*)$/', $l, $m)) return null;
+    $msg = $m[3];
+    $client = preg_match('/, client: ([^,]+)/', $msg, $x) ? $x[1] : null;
+    $request = preg_match('/, request: "([^"]*)"/', $msg, $x) ? $x[1] : null;
+    return [
+        'timestamp' => str_replace('/', '-', $m[1]),
+        'level'     => strtolower($m[2]),
+        'message'   => (string)preg_replace('/, client: .*$/', '', $msg),
+        'client'    => $client,
+        'request'   => $request,
+    ];
+}
+
+/**
+ * PHP error_log / WordPress debug.log. An entry starts with "[22-Sep-2026 18:30:00 UTC]";
+ * any following line that does not (Stack trace:, #0 ..., thrown in ...) belongs to it.
+ */
+function parsePhpErrorLog(array $lines): array {
+    $entries = [];
+    $cur = null;
+    foreach ($lines as $l) {
+        $l = rtrim((string)$l, "\r");
+        if (preg_match('/^\[(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2})(?: [^\]]*)?\] (.*)$/', $l, $m)) {
+            if ($cur !== null) $entries[] = $cur;
+            $body = $m[2];
+            $sev = 'info';
+            if (preg_match('/^PHP ([A-Za-z ]+?)\s*:\s+(.*)$/', $body, $x)) {
+                $t = strtolower($x[1]);
+                $body = $x[2];
+                $sev = match (true) {
+                    str_contains($t, 'fatal') || str_contains($t, 'parse') => 'fatal',
+                    str_contains($t, 'warning') => 'warning',
+                    str_contains($t, 'deprecated') => 'deprecated',
+                    str_contains($t, 'notice') || str_contains($t, 'strict') => 'notice',
+                    default => 'error',
+                };
+            }
+            $file = null;
+            $line = null;
+            if (preg_match('/ in (\/\S+?)(?: on line |:)(\d+)\s*$/', $body, $x)) {
+                $file = $x[1];
+                $line = (int)$x[2];
+                $body = substr($body, 0, -strlen($x[0]));
+            }
+            $cur = ['timestamp' => fmtPhpTime($m[1]), 'severity' => $sev, 'level' => $sev,
+                    'message' => $body, 'file' => $file, 'line' => $line, 'stack_trace' => ''];
+        } elseif ($cur !== null && trim($l) !== '') {
+            $cur['stack_trace'] .= ($cur['stack_trace'] === '' ? '' : "\n") . $l;
+        }
+    }
+    if ($cur !== null) $entries[] = $cur;
+    foreach ($entries as &$e) {
+        if ($e['stack_trace'] === '') $e['stack_trace'] = null;
+        if ($e['file'] === null && $e['stack_trace'] !== null
+            && preg_match('/thrown in (\/\S+) on line (\d+)/', $e['stack_trace'], $x)) {
+            $e['file'] = $x[1];
+            $e['line'] = (int)$x[2];
+        }
+    }
+    unset($e);
+    return $entries; // oldest first
+}
+
+/** Collapse repeats of the same error (numbers normalised) into one row with a count. */
+function groupPhpErrors(array $entries): array {
+    $g = [];
+    foreach ($entries as $e) {
+        $k = $e['severity'] . '|' . $e['file'] . '|' . $e['line'] . '|'
+           . preg_replace('/\d+/', 'N', substr($e['message'], 0, 300));
+        if (!isset($g[$k])) $g[$k] = $e + ['count' => 0, 'first_seen' => $e['timestamp']];
+        $g[$k]['count']++;
+        $g[$k]['last_seen'] = $e['timestamp'];
+    }
+    $out = array_values($g);
+    usort($out, static fn(array $a, array $b): int => [$b['count'], $b['last_seen']] <=> [$a['count'], $a['last_seen']]);
+    return $out;
+}
+
+/** PHP-FPM slowlog: "[22-Sep-2026 18:30:00]  [pool site] pid 123", script_filename = ..., then the trace. */
+function parseSlowLog(array $lines, string $siteDir): array {
+    $entries = [];
+    $cur = null;
+    foreach ($lines as $l) {
+        $l = (string)$l;
+        if (preg_match('/^\[(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2})\]\s+\[pool ([^\]]+)\] pid (\d+)/', $l, $m)) {
+            if ($cur !== null) $entries[] = $cur;
+            $cur = ['timestamp' => fmtPhpTime($m[1]), 'pool' => $m[2], 'pid' => (int)$m[3], 'script' => null, 'trace' => []];
+        } elseif ($cur !== null) {
+            if (preg_match('/^script_filename = (.*)$/', $l, $m)) $cur['script'] = str_replace($siteDir, '', $m[1]);
+            elseif (trim($l) !== '') $cur['trace'][] = str_replace($siteDir, '', $l);
+        }
+    }
+    if ($cur !== null) $entries[] = $cur;
+    return array_map(static fn(array $e): array => [
+        'timestamp'   => $e['timestamp'],
+        'pool'        => $e['pool'],
+        'pid'         => $e['pid'],
+        'script'      => $e['script'] ?? '(unknown)',
+        'top_frame'   => $e['trace'][0] ?? null,
+        'stack_trace' => $e['trace'] ? implode("\n", $e['trace']) : null,
+    ], $entries);
+}
+
+//=============================================================================
 // WORDPRESS.ORG DIRECTORY
 //=============================================================================
 function fetchWpOrgApi(string $type, array $params): ?array {
@@ -463,7 +606,7 @@ $MUTATING = [
     // legacy panel names + new features
     'start_backup', 'restore_backup', 'db_export', 'auto_login',
     'create_staging', 'delete_staging', 'push_to_live', 'pull_from_live',
-    'terminal_exec', 'terminal_wpcli',
+    'terminal_exec', 'terminal_wpcli', 'debug_toggle', 'debug_clear',
     'plugin_auto_update_enable', 'plugin_auto_update_disable',
     'theme_auto_update_enable', 'theme_auto_update_disable', 'wp_auto_update_set',
 ];
@@ -482,9 +625,10 @@ try {
             $domain = vDomain();
             if (getSite($domain)) apiError('Site already exists', 409);
             $phpVersion = vPhp((string)param('php_version', (string)($CFG['default_php'] ?? '8.4')));
-            $adminEmail = (string)param('admin_email', "admin@{$domain}");
-            $title      = (string)param('title', $domain);
-            $adminUser  = (string)param('admin_user', 'admin');
+            // accept the Portal's legacy names (wp_email / site_title / wp_user) too
+            $adminEmail = (string)param('admin_email', (string)param('wp_email', "admin@{$domain}"));
+            $title      = (string)param('title', (string)param('site_title', $domain));
+            $adminUser  = (string)param('admin_user', (string)param('wp_user', 'admin'));
             $plan       = (string)param('plan', 'standard');
             if (!filter_var($adminEmail, FILTER_VALIDATE_EMAIL)) apiError('Invalid admin email');
             if (!preg_match('/^[a-zA-Z0-9._@-]{1,60}$/', $adminUser)) apiError('Invalid admin username');
@@ -1155,50 +1299,110 @@ try {
             apiSuccess($info);
 
         //=====================================================================
-        // LOG VIEWERS (legacy panel names -> site_logs)
+        // LOG VIEWERS - parsed into the structured entries the panel renders
         //=====================================================================
         case 'access_logs':
+            $domain = vDomain(); requireSite($domain);
+            $window = paramInt('lines', 1000, 50, 5000);
+            $page = paramInt('page', 1, 1, 100000);
+            $perPage = paramInt('per_page', 50, 10, 500);
+            $filter = (string)param('filter', '');
+            $statusF = strtolower((string)param('status', ''));
+            $d = agentOrFail('site-inspect', [$domain, 'logs', 'access', (string)$window], 'Log read failed', 60);
+            $rows = [];
+            foreach (array_reverse(is_array($d['lines'] ?? null) ? $d['lines'] : []) as $l) {
+                $l = (string)$l;
+                if ($filter !== '' && stripos($l, $filter) === false) continue;
+                $e = parseAccessLine($l);
+                if ($e === null) continue;
+                if ($statusF !== '') {
+                    if (preg_match('/^([1-5])xx$/', $statusF, $x)) {
+                        if (intdiv($e['status'], 100) !== (int)$x[1]) continue;
+                    } elseif (ctype_digit($statusF) && $e['status'] !== (int)$statusF) {
+                        continue;
+                    }
+                }
+                $rows[] = $e;
+            }
+            $total = count($rows);
+            apiSuccess(['logs' => array_values(array_slice($rows, ($page - 1) * $perPage, $perPage)),
+                        'page' => $page, 'per_page' => $perPage, 'total' => $total,
+                        'total_pages' => max(1, (int)ceil($total / $perPage))]);
+
         case 'error_logs':
+            $domain = vDomain(); requireSite($domain);
+            $n = paramInt('lines', 100, 10, 2000);
+            $sev = strtolower((string)param('severity', ''));
+            $d = agentOrFail('site-inspect', [$domain, 'logs', 'error', (string)min(5000, $n * 3)], 'Log read failed', 60);
+            $counts = ['emerg' => 0, 'alert' => 0, 'crit' => 0, 'error' => 0, 'warn' => 0, 'notice' => 0, 'info' => 0];
+            $rows = [];
+            foreach (array_reverse(is_array($d['lines'] ?? null) ? $d['lines'] : []) as $l) {
+                $e = parseNginxErrorLine((string)$l);
+                if ($e === null) continue;
+                $counts[$e['level']] = ($counts[$e['level']] ?? 0) + 1;
+                if ($sev !== '' && $e['level'] !== $sev) continue;
+                if (count($rows) < $n) $rows[] = $e;
+            }
+            apiSuccess(['logs' => $rows, 'counts' => $counts, 'total' => array_sum($counts)]);
+
         case 'php_error_logs':
-        case 'php_slow_logs':
         case 'debug_log':
             $domain = vDomain(); requireSite($domain);
-            $logMap = ['access_logs' => 'access', 'error_logs' => 'error', 'php_error_logs' => 'php-error',
-                       'php_slow_logs' => 'php-slow', 'debug_log' => 'php-error'];
-            $type = $logMap[$action];
-            $page = paramInt('page', 1, 1, 10000);
-            $perPage = paramInt('per_page', 100, 10, 500);
-            $d = agentOrFail('site-inspect', [$domain, 'logs', $type, '2000'], 'Log read failed', 60);
-            $lines = array_reverse(is_array($d['lines'] ?? null) ? $d['lines'] : []); // newest first
-            $total = count($lines);
-            $slice = array_values(array_slice($lines, ($page - 1) * $perPage, $perPage));
-            $out = ['logs' => $slice, 'lines' => $slice, 'type' => $type, 'page' => $page,
-                    'per_page' => $perPage, 'total' => $total,
-                    'total_pages' => max(1, (int)ceil($total / $perPage))];
-            if ($action === 'error_logs') {
-                $groups = [];
-                foreach ($slice as $l) {
-                    $k = preg_replace('/^\[[^\]]*\]\s*/', '', (string)$l);
-                    $k = substr((string)preg_replace('/\b\d+\b/', 'N', (string)$k), 0, 200);
-                    if (!isset($groups[$k])) $groups[$k] = ['message' => $k, 'count' => 0, 'sample' => $l];
-                    $groups[$k]['count']++;
-                }
-                usort($groups, static fn(array $a, array $b): int => $b['count'] <=> $a['count']);
-                $out['grouped'] = $groups;
+            $n = paramInt('lines', 100, 10, 1000);
+            $sev = strtolower((string)param('severity', ''));
+            $type = $action === 'debug_log' ? 'wp-debug' : 'php-error';
+            $d = agentOrFail('site-inspect', [$domain, 'logs', $type, '5000'], 'Log read failed', 60);
+            $siteDir = '/var/www/sites/' . $domain;
+            $entries = parsePhpErrorLog(is_array($d['lines'] ?? null) ? $d['lines'] : []);
+            foreach ($entries as &$e) {
+                if ($e['file'] !== null) $e['file'] = str_replace($siteDir, '', $e['file']);
+                if ($e['stack_trace'] !== null) $e['stack_trace'] = str_replace($siteDir, '', $e['stack_trace']);
+                $e['message'] = str_replace($siteDir, '', $e['message']);
             }
+            unset($e);
+            if ($sev !== '') $entries = array_values(array_filter($entries, static fn(array $e): bool => $e['severity'] === $sev));
+            $out = ['logs' => array_slice(array_reverse($entries), 0, $n), 'grouped' => groupPhpErrors($entries),
+                    'total' => count($entries), 'exists' => (bool)($d['exists'] ?? true)];
             if ($action === 'debug_log') {
-                $out['enabled'] = true;
-                $out['expires_at'] = null;
-                $out['log_size_formatted'] = $total . ' lines';
+                $st = agent('debug-mode', [$domain, 'status'], 60);
+                if (!empty($st['success'])) $out += agentData($st);
             }
             apiSuccess($out);
+
+        case 'php_slow_logs':
+            $domain = vDomain(); requireSite($domain);
+            $n = paramInt('lines', 50, 5, 500);
+            $d = agentOrFail('site-inspect', [$domain, 'logs', 'php-slow', '5000'], 'Log read failed', 60);
+            $entries = array_reverse(parseSlowLog(is_array($d['lines'] ?? null) ? $d['lines'] : [], '/var/www/sites/' . $domain));
+            apiSuccess(['logs' => array_slice($entries, 0, $n), 'total' => count($entries)]);
+
+        //=====================================================================
+        // WORDPRESS DEBUG MODE (runs on the engine; auto-disables via timer)
+        //=====================================================================
+        case 'debug_status':
+            $domain = vDomain(); requireSite($domain);
+            apiSuccess(agentOrFail('debug-mode', [$domain, 'status'], 'Debug status unavailable', 60));
+
+        case 'debug_toggle':
+            $domain = vDomain(); requireSite($domain);
+            $args = flag('enable', true)
+                ? [$domain, 'enable', (string)paramInt('hours', 2, 1, 72)]
+                : [$domain, 'disable'];
+            $r = agent('debug-mode', $args, 120);
+            if (empty($r['success'])) apiError((string)($r['error'] ?? 'Could not change debug mode'), 500);
+            apiSuccess(agentData($r), (string)($r['message'] ?? 'OK'));
+
+        case 'debug_clear':
+            $domain = vDomain(); requireSite($domain);
+            apiSuccess(agentOrFail('debug-mode', [$domain, 'clear'], 'Could not clear the debug log', 60), 'Debug log cleared');
 
         case 'logs_export':
             $domain = vDomain(); requireSite($domain);
             $expMap = ['access' => 'access', 'error' => 'error', 'php-error' => 'php-error',
-                       'php_error' => 'php-error', 'php-slow' => 'php-slow', 'php_slow' => 'php-slow',
+                       'php_error' => 'php-error', 'php' => 'php-error', 'php-slow' => 'php-slow',
+                       'php_slow' => 'php-slow', 'slow' => 'php-slow', 'debug' => 'wp-debug',
                        'php-fpm' => 'php-fpm', 'wp-cron' => 'wp-cron'];
-            $type = (string)param('type', 'error');
+            $type = (string)param('log_type', (string)param('type', 'error'));
             if (!isset($expMap[$type])) apiError('Invalid log type');
             $d = agentOrFail('site-inspect', [$domain, 'logs', $expMap[$type], '2000'], 'Log export failed', 60);
             $lines = is_array($d['lines'] ?? null) ? $d['lines'] : [];
@@ -1223,31 +1427,42 @@ try {
             logActivity((int)$site['id'], $action, ['target' => $slug !== '' ? $slug : 'all']);
             apiSuccess(['output' => wpOutput($r)], ucfirst($kind) . " auto-updates {$verb}d");
 
+        // The panel speaks off / minor / major; WordPress stores false / 'minor' / true.
         case 'wp_auto_update_status':
             $domain = vDomain(); requireSite($domain);
             $r = wp($domain, ['config', 'get', 'WP_AUTO_UPDATE_CORE', '--type=constant']);
-            $v = empty($r['success']) ? 'minor' : trim(wpOutput($r));
-            if ($v === '') $v = 'minor';
-            apiSuccess(['auto_update' => $v, 'value' => $v,
-                        'enabled' => in_array($v, ['true', '1', 'minor', 'beta', 'rc'], true)]);
+            if (empty($r['success'])) {
+                $mode = 'minor'; // constant not defined: WordPress default is minor-only
+            } else {
+                $v = strtolower(trim(wpOutput($r)));
+                $mode = match (true) {
+                    $v === '' || $v === '0' || $v === 'false' => 'off',
+                    $v === 'minor' => 'minor',
+                    default => 'major',
+                };
+            }
+            apiSuccess(['auto_update' => $mode, 'mode' => $mode, 'value' => $mode, 'enabled' => $mode !== 'off']);
 
         case 'wp_auto_update_set':
             $domain = vDomain(); $site = requireSite($domain);
-            $v = (string)param('value', (string)param('auto_update', 'minor'));
-            if (!in_array($v, ['true', 'false', 'minor'], true)) apiError('value must be true, false or minor');
+            $in = strtolower((string)param('mode', (string)param('value', (string)param('auto_update', 'minor'))));
+            $toWp = ['off' => 'false', 'false' => 'false', 'minor' => 'minor', 'major' => 'true', 'true' => 'true'];
+            if (!isset($toWp[$in])) apiError('mode must be off, minor or major');
+            $v = $toWp[$in];
             $args = ['config', 'set', 'WP_AUTO_UPDATE_CORE', $v, '--type=constant'];
             if ($v !== 'minor') $args[] = '--raw';
             $r = wp($domain, $args);
             wpRequire($r, 'Auto-update setting');
-            logActivity((int)$site['id'], 'wp_auto_update_set', ['value' => $v]);
-            apiSuccess(['auto_update' => $v, 'output' => wpOutput($r)], 'Core auto-update policy updated');
+            $mode = ['false' => 'off', 'minor' => 'minor', 'true' => 'major'][$v];
+            logActivity((int)$site['id'], 'wp_auto_update_set', ['mode' => $mode]);
+            apiSuccess(['auto_update' => $mode, 'mode' => $mode, 'output' => wpOutput($r)], 'Core auto-update policy updated');
 
         //=====================================================================
         // BACKUPS (legacy panel names)
         //=====================================================================
         case 'start_backup':
             $domain = vDomain(); $site = requireSite($domain);
-            $type = (string)param('type', 'full');
+            $type = (string)param('backup_type', (string)param('type', 'full'));
             if (!in_array($type, ['full', 'files', 'database'], true)) $type = 'full';
             $note = substr((string)param('note', 'panel'), 0, 200);
             if (!preg_match('/^[A-Za-z0-9._ -]*$/', $note)) $note = 'panel';
@@ -1315,7 +1530,16 @@ try {
                       'list_stagings' => 'list', 'push_to_live' => 'push', 'pull_from_live' => 'pull'];
             $op = $opMap[$action];
             $slow = in_array($op, ['create', 'push', 'pull'], true);
-            $r = agent('staging', [$domain, $op], $slow ? 880 : 120);
+            $stgArgs = [$domain, $op];
+            if ($op === 'create') {
+                // the panel picks a hostname its DNS + CDN certificate actually cover
+                $sd = strtolower((string)param('staging_domain', ''));
+                if ($sd !== '') {
+                    if (!preg_match(RE_DOMAIN, $sd)) apiError('Invalid staging domain');
+                    $stgArgs[] = $sd;
+                }
+            }
+            $r = agent('staging', $stgArgs, $slow ? 880 : 120);
             if (empty($r['success'])) apiError((string)($r['error'] ?? 'Staging operation failed'), 500);
             if ($op !== 'info' && $op !== 'list') logActivity((int)$site['id'], 'staging_' . $op, []);
             apiSuccess(agentData($r), (string)($r['message'] ?? 'OK'));

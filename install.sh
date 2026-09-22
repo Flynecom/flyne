@@ -808,7 +808,7 @@ case "$ACTION" in
     create-site|delete-site|render-site|php-switch|php-restart|sftp-enable|sftp-disable|\
     cache-purge|wp-cli|ssl-issue|ssl-status|backup-create|backup-list|backup-restore|\
     backup-delete|site-suspend|site-unsuspend|site-limits|site-inspect|system-check|\
-    site-stats|staging|terminal|db-export|auto-login|download-claim) ;;
+    site-stats|staging|terminal|db-export|auto-login|download-claim|debug-mode) ;;
     *) deny "Unknown agent action" ;;
 esac
 
@@ -822,6 +822,20 @@ MODE=$(stat -c '%a' "$SCRIPT"); OWNER=$(stat -c '%U' "$SCRIPT")
 # hard cap on argument count / size so a bug upstream cannot turn into a DoS
 [[ $# -le 64 ]] || deny "Too many arguments"
 for a in "$@"; do [[ ${#a} -le 8192 ]] || deny "Argument too long"; done
+
+# The API runs sandboxed (ProtectSystem=full, reduced capabilities, 512M cgroup)
+# and sudo does NOT escape that: every child inherits it, so /etc would be
+# read-only and useradd, vhost writes, unit files and cron would all fail.
+# Hand the action to PID 1 as a fresh transient unit instead: clean root
+# context, own cgroup in system.slice, stdin/stdout/exit code piped back.
+if [[ "${FLYNE_AGENT_DETACHED:-0}" != "1" ]]; then
+    exec systemd-run --quiet --pipe --wait --collect --service-type=exec \
+        --unit="flyne-agent-${ACTION}-$(date +%s%N)" \
+        --description="Flyne agent: ${ACTION}" \
+        --property=TimeoutStopSec=30 \
+        --setenv=FLYNE_AGENT_DETACHED=1 \
+        -- /opt/flyne/bin/flyne-agent "$ACTION" "$@"
+fi
 
 exec /bin/bash "$SCRIPT" "$@"
 EOF
@@ -2059,6 +2073,8 @@ rm -f "${FLYNE_ETC}/ssl/${DOMAIN}.crt" "${FLYNE_ETC}/ssl/${DOMAIN}.key"
 # staging environment (its DB and vhost are not covered by the FK cascade)
 STG_DOMAIN="staging.${DOMAIN}"
 if [[ -n "$SID" ]]; then
+    STG_ROW_DOMAIN=$(db "SELECT IFNULL(staging_domain,'') FROM staging WHERE site_id=${SID}")
+    valid_domain "$STG_ROW_DOMAIN" && STG_DOMAIN="$STG_ROW_DOMAIN"
     STG_DB=$(db "SELECT IFNULL(db_name,'') FROM staging WHERE site_id=${SID}")
     [[ "$STG_DB" =~ ^stg_[a-z0-9_]+$ ]] && mysql -e "DROP DATABASE IF EXISTS \`${STG_DB}\`;" 2>/dev/null || true
 fi
@@ -2630,11 +2646,13 @@ case "$WHAT" in
               '{total_mb:$t, quota_mb:$q, db_mb:$d, backups_mb:$b, breakdown:{public:$p, uploads:$u, logs:$l, tmp:$tm}}')" ;;
     logs)
         TYPE="${3:-error}"; LINES="${4:-100}"
-        is_int "$LINES" || LINES=100; (( LINES > 2000 )) && LINES=2000; (( LINES < 1 )) && LINES=1
-        case "$TYPE" in access|error|php-error|php-slow|php-fpm|wp-cron) ;; *) fail "Unknown log type" ;; esac
-        F="${LOGS_DIR}/${TYPE}.log"
-        [[ -f "$F" ]] || ok '{"lines":[]}'
-        ok "$(tail -n "$LINES" "$F" | jq -Rn --arg t "$TYPE" '{type:$t, lines:[inputs]}')" ;;
+        # multi-line formats (stack traces, slowlog) need a generous raw window
+        is_int "$LINES" || LINES=100; (( LINES > 5000 )) && LINES=5000; (( LINES < 1 )) && LINES=1
+        case "$TYPE" in access|error|php-error|php-slow|php-fpm|wp-cron|wp-debug) ;; *) fail "Unknown log type" ;; esac
+        if [[ "$TYPE" == "wp-debug" ]]; then F="${DOC_ROOT}/wp-content/debug.log"; else F="${LOGS_DIR}/${TYPE}.log"; fi
+        [[ -f "$F" ]] || ok "$(jq -cn --arg t "$TYPE" '{type:$t, lines:[], exists:false}')"
+        SZ=$(stat -c%s "$F")
+        ok "$(tail -n "$LINES" "$F" | jq -Rn --arg t "$TYPE" --argjson s "$SZ" '{type:$t, exists:true, size:$s, lines:[inputs]}')" ;;
     theme-screenshots)
         [[ -d "${DOC_ROOT}/wp-content/themes" ]] || ok '{"screenshots":{}}'
         SCHEME=http; [[ "$SSL" == "1" ]] && SCHEME=https
@@ -2823,30 +2841,38 @@ read_logs() {
 # Log format "flyne": ip - user [date tz] "METHOD path PROTO" status bytes "ref" "ua" rt=.. urt=.. cache=..
 # The last three fields are always rt/urt/cache, whatever the user agent contains.
 TSV=$(read_logs 2>/dev/null | awk -v dre="$DRE" '
+    BEGIN { slow_t = 2.0 }
     index($4, "[") == 1 && $4 ~ dre {
         req++
         ip[$1] = 1
-        st = $9 + 0
-        by = $10 + 0
+        # a malformed request is logged as "-" and shifts every later field left by two
+        if ($6 == "\"-\"") { st = $7 + 0; by = $8 + 0; m = "-"; p = "" }
+        else { st = $9 + 0; by = $10 + 0; m = $6; sub(/^"/, "", m); p = $7; sub(/\?.*$/, "", p) }
         bytes += by
         if (st >= 500) s5xx++; else if (st >= 400) s4xx++; else if (st >= 300) s3xx++; else if (st >= 200) s2xx++
         c = $NF; sub(/^cache=/, "", c)
         if (c == "HIT") hit++; else if (c != "-" && c != "") miss++
         r = $(NF-2); sub(/^rt=/, "", r); r = r + 0
-        if (r > 0) { rtsum += r; rtn++; if (r > slow_t) slow++ }
-        m = $6; sub(/^"/, "", m)
         meth[m]++
-        p = $7; sub(/\?.*$/, "", p)
-        if (length(p) > 0 && length(p) <= 200) page[p]++
+        okp = (length(p) > 0 && length(p) <= 200)
+        if (okp) page[p]++
+        if (r > 0) {
+            rtsum += r; rtn++
+            if (r > slow_t) slow++
+            if (okp) {
+                ucnt[p]++; usum[p] += r
+                if (r > umax[p]) umax[p] = r
+                if (!(p in umin) || r < umin[p]) umin[p] = r
+            }
+        }
         d = substr($4, 2, 11)
         dreq[d]++; dbytes[d] += by
-        if (!( (d SUBSEP $1) in dseen )) { dseen[d SUBSEP $1] = 1; dvis[d]++ }
-        b = $1
-        botq = tolower($0)
-        if (botq ~ /bot|crawl|spider|slurp/) bots++
+        if (!((d SUBSEP $1) in dseen)) { dseen[d SUBSEP $1] = 1; dvis[d]++ }
+        if (tolower($0) ~ /bot|crawl|spider|slurp/) bots++
     }
-    BEGIN { slow_t = 1.0 }
     END {
+        printf "T\ttimed\t%d\n", rtn + 0
+        for (k in ucnt) printf "U\t%s\t%d\t%.6f\t%.6f\t%.6f\n", k, ucnt[k], usum[k] / ucnt[k], umax[k], umin[k]
         u = 0; for (k in ip) u++
         printf "T\trequests\t%d\n", req + 0
         printf "T\tbytes\t%d\n", bytes + 0
@@ -2874,22 +2900,33 @@ JSON=$(printf '%s\n' "$TSV" | jq -Rn --argjson days "$DAYS" '
     | ($rows | map(select(.[0] == "D")) | map({date: .[1], requests: (.[2] | tonumber),
         bytes: (.[3] | tonumber), visitors: (.[4] | tonumber)}) | sort_by(.date)) as $daily
     | ($rows | map(select(.[0] == "M")) | map({key: .[1], value: (.[2] | tonumber)}) | from_entries) as $methods
+    | ($rows | map(select(.[0] == "U")) | map({url: .[1], count: (.[2] | tonumber),
+        avg_time: (.[3] | tonumber), max_time: (.[4] | tonumber), min_time: (.[5] | tonumber)})) as $urls
     | (($t.cache_hit // 0) + ($t.cache_miss // 0)) as $cacheable
+    | ($t.bytes // 0) as $b
+    | (if $b >= 1073741824 then "\((($b / 1073741824) * 100 | round) / 100) GB"
+       elif $b >= 1048576 then "\((($b / 1048576) * 100 | round) / 100) MB"
+       elif $b >= 1024 then "\((($b / 1024) * 10 | round) / 10) KB"
+       else "\($b) B" end) as $bfmt
+    | { "2xx": ($t.status_2xx // 0), "3xx": ($t.status_3xx // 0),
+        "4xx": ($t.status_4xx // 0), "5xx": ($t.status_5xx // 0) } as $status
     | {
         period_days: $days,
-        requests: ($t.requests // 0),
-        visitors: ($t.visitors // 0),
-        bytes: ($t.bytes // 0),
-        bandwidth_mb: (((($t.bytes // 0) / 1048576) * 100 | round) / 100),
+        requests: ($t.requests // 0),       total_requests: ($t.requests // 0),
+        visitors: ($t.visitors // 0),       unique_visitors: ($t.visitors // 0),
+        bytes: $b,
+        bandwidth_mb: ((($b / 1048576) * 100 | round) / 100),
+        bandwidth_formatted: $bfmt,
         avg_response_ms: ($t.avg_ms // 0),
+        timed_requests: ($t.timed // 0),
         slow_requests: ($t.slow_requests // 0),
         bot_requests: ($t.bot_requests // 0),
         cache_hit_rate: (if $cacheable > 0 then ((($t.cache_hit // 0) * 1000 / $cacheable | round) / 10) else 0 end),
-        status: { "2xx": ($t.status_2xx // 0), "3xx": ($t.status_3xx // 0),
-                  "4xx": ($t.status_4xx // 0), "5xx": ($t.status_5xx // 0) },
+        status: $status,                    status_codes: $status,
         methods: $methods,
         top_pages: $pages,
-        daily: $daily
+        daily: $daily,
+        urls: $urls
       }')
 
 case "$WHAT" in
@@ -2904,12 +2941,26 @@ case "$WHAT" in
                 QUERY_STRING=json REQUEST_METHOD=GET \
                 cgi-fcgi -bind -connect "$PHP_SOCK" 2>/dev/null | sed -n '/{/,$p' || true)
         jq -e . >/dev/null 2>&1 <<< "$FPM" || FPM='{}'
-        ok "$(jq -cn --argjson j "$JSON" --argjson f "$FPM" \
-              '{avg_response_ms: $j.avg_response_ms, slow_requests: $j.slow_requests,
+        ok "$(jq -cn --argjson j "$JSON" --argjson f "$FPM" '
+            ($j.timed_requests > 0) as $timed
+            | {
+                summary: {
+                    total_requests: $j.requests,
+                    avg_response_time: (($j.avg_response_ms / 1000 * 1000 | round) / 1000),
+                    slow_requests: $j.slow_requests,
+                    slow_percentage: (if $j.timed_requests > 0
+                        then (($j.slow_requests * 1000 / $j.timed_requests | round) / 10) else 0 end),
+                    has_response_time: $timed,
+                    cache_hit_rate: $j.cache_hit_rate
+                },
+                slow_urls: (if $timed then ($j.urls | sort_by(-.avg_time) | .[0:25])
+                            else ($j.top_pages | map({url: .path, count: .hits})) end),
+                avg_response_ms: $j.avg_response_ms, slow_requests: $j.slow_requests,
                 cache_hit_rate: $j.cache_hit_rate, requests: $j.requests,
-                status: $j.status, period_days: $j.period_days, php_fpm: $f}')" ;;
+                status: $j.status, period_days: $j.period_days, php_fpm: $f
+              }')" ;;
     analytics)
-        ok "$(jq -cn --argjson j "$JSON" '{analytics: $j}')" ;;
+        ok "$(jq -cn --argjson j "$JSON" '{analytics: ($j | del(.urls))}')" ;;
 esac
 SCRIPT
 
@@ -3029,13 +3080,20 @@ SCRIPT
 # means staging cannot be used to double a customer's resource allocation.
 cat > "${FLYNE_DIR}/scripts/staging.sh" << 'SCRIPT'
 #!/bin/bash
-# staging.sh <domain> create|delete|info|list|push|pull [--yes]
+# staging.sh <domain> create [staging_domain] | delete | info | list | push | pull | ssl
 source /opt/flyne/scripts/lib.sh
 load_site "${1:-}"
 OP="${2:-info}"
 SID=$(site_id); [[ -n "$SID" ]] || fail "Site is not registered"
 
-STG_DOMAIN="staging.${DOMAIN}"
+# The staging hostname is chosen at creation time (the panel passes one that its
+# DNS/CDN certificate actually covers, e.g. staging-<name>.wpgo.site) and is then
+# read back from the database for every later operation.
+STG_DOMAIN=$(db "SELECT IFNULL(staging_domain,'') FROM staging WHERE site_id=${SID}")
+if [[ -z "$STG_DOMAIN" ]]; then
+    STG_DOMAIN="${3:-staging.${DOMAIN}}"
+    STG_DOMAIN="${STG_DOMAIN,,}"
+fi
 STG_DIR="${SITE_DIR}/staging"
 STG_DOC="${STG_DIR}/public"
 STG_DB="stg_${SITE_HASH:0:10}"
@@ -3049,7 +3107,12 @@ wp_stg() {
         timeout 900 "/usr/bin/php${PHP_VERSION}" -d memory_limit=512M -d max_execution_time=0 \
         /usr/local/bin/wp --path="$STG_DOC" --no-color "$@"
 }
-stg_row() { db "SELECT staging_domain, db_name, status, auth_user, IFNULL(DATE_FORMAT(last_push_at,'%Y-%m-%dT%H:%i:%sZ'),''), IFNULL(DATE_FORMAT(last_pull_at,'%Y-%m-%dT%H:%i:%sZ'),''), IFNULL(DATE_FORMAT(created_at,'%Y-%m-%dT%H:%i:%sZ'),'') FROM staging WHERE site_id=${SID}"; }
+# Fields joined with ASCII 0x1F: tab is IFS *whitespace*, so `read` would collapse
+# consecutive tabs and shift every field after an empty one (e.g. last_push_at).
+stg_row() { db "SELECT CONCAT_WS(CHAR(31), staging_domain, db_name, status, IFNULL(auth_user,''),
+    IFNULL(DATE_FORMAT(last_push_at,'%Y-%m-%dT%H:%i:%sZ'),''), IFNULL(DATE_FORMAT(last_pull_at,'%Y-%m-%dT%H:%i:%sZ'),''),
+    IFNULL(DATE_FORMAT(created_at,'%Y-%m-%dT%H:%i:%sZ'),''), IFNULL(auth_pass,''), ssl_enabled)
+    FROM staging WHERE site_id=${SID}"; }
 
 render_staging_vhost() {
     local cert="/etc/letsencrypt/live/${STG_DOMAIN}/fullchain.pem" key="/etc/letsencrypt/live/${STG_DOMAIN}/privkey.pem"
@@ -3118,6 +3181,18 @@ sync_live_to_staging() {
         -e "s/define( *'DB_USER'.*/define('DB_USER', '${stg_user}');/" \
         -e "s/define( *'DB_PASSWORD'.*/define('DB_PASSWORD', '${stg_pass}');/" \
         "${STG_DOC}/wp-config.php" || return 1
+    # Staging shares the live site's Redis socket and key prefix. Left enabled it
+    # would read live's cached options (siteurl!) and redirect to production, and
+    # a flush on staging would wipe live's cache. Disable the object cache here -
+    # BEFORE any command below loads WordPress.
+    if ! wp_stg config set WP_REDIS_DISABLED true --raw --type=constant >/dev/null 2>&1; then
+        # no placement anchor in this wp-config: put the define right after <?php
+        runuser -u "$SITE_USER" -- sed -i "0,/<?php/s//<?php\ndefine('WP_REDIS_DISABLED', true);/" \
+            "${STG_DOC}/wp-config.php" || return 1
+    fi
+    grep -q "WP_REDIS_DISABLED', *true" "${STG_DOC}/wp-config.php" || { log "could not disable Redis on staging"; return 1; }
+    wp_stg config set WP_REDIS_PREFIX "${SITE_HASH}stg:" --type=constant >/dev/null 2>&1 || true
+    wp_stg config set WP_ENVIRONMENT_TYPE staging --type=constant >/dev/null 2>&1 || true
     wp_stg search-replace "//${DOMAIN}" "//${STG_DOMAIN}" --all-tables-with-prefix --skip-columns=guid --quiet >/dev/null 2>&1 || true
     wp_stg option update home "https://${STG_DOMAIN}" >/dev/null 2>&1 || true
     wp_stg option update siteurl "https://${STG_DOMAIN}" >/dev/null 2>&1 || true
@@ -3135,6 +3210,10 @@ case "$OP" in
 create)
     [[ -n "$(stg_row)" ]] && fail "Staging already exists for ${DOMAIN}"
     [[ "$SUSPENDED" == "1" ]] && fail "Site is suspended"
+    valid_domain "$STG_DOMAIN" || fail "Invalid staging domain"
+    [[ "$STG_DOMAIN" != "$DOMAIN" && "$STG_DOMAIN" != "www.${DOMAIN}" ]] || fail "Staging domain must differ from the live domain"
+    [[ -z "$(db "SELECT id FROM sites WHERE domain='$(sql_esc "$STG_DOMAIN")'")" ]] || fail "Staging domain is already used by another site"
+    [[ -z "$(db "SELECT id FROM staging WHERE staging_domain='$(sql_esc "$STG_DOMAIN")'")" ]] || fail "Staging domain is already in use"
     [[ -f "${DOC_ROOT}/wp-config.php" ]] || fail "WordPress is not installed on the live site"
     LIVE_DBU=$(db "SELECT db_user FROM sites WHERE id=${SID}")
     LIVE_DBP=$(db "SELECT db_pass FROM sites WHERE id=${SID}")
@@ -3160,8 +3239,9 @@ create)
     render_staging_vhost || { db "UPDATE staging SET status='error' WHERE site_id=${SID}"; fail "nginx rejected the staging vhost"; }
     db "UPDATE staging SET status='active' WHERE site_id=${SID}"
     log_activity staging_created "{\"staging_domain\":\"${STG_DOMAIN}\"}" "$SID"
+    # Let's Encrypt in the background (staging is not a site, so it has its own ssl op)
     systemd-run --quiet --no-block --collect --unit="flyne-stgssl-${SITE_HASH}-$(date +%s)" \
-        /opt/flyne/scripts/ssl-issue.sh "$STG_DOMAIN" >/dev/null 2>&1 || true
+        /opt/flyne/bin/flyne-agent staging "$DOMAIN" ssl >/dev/null 2>&1 || true
     ok "$(jq -cn --arg d "$STG_DOMAIN" --arg u "https://${STG_DOMAIN}" --arg au "$AUTH_USER" --arg ap "$AUTH_PASS" \
         '{staging_domain:$d, staging_url:$u, url:$u, staging_admin:($u+"/wp-admin/"),
           auth_user:$au, auth_pass:$ap, status:"active"}')" "Staging environment created"
@@ -3221,6 +3301,8 @@ push)
         db "UPDATE staging SET status='error' WHERE site_id=${SID}"
         fail "Database push failed - restore the pre-push backup"
     fi
+    # live's Redis still holds pre-push options; drop them before WordPress reloads
+    wp_run cache flush >/dev/null 2>&1 || true
     wp_run search-replace "//${STG_DOMAIN}" "//${DOMAIN}" --all-tables-with-prefix --skip-columns=guid --quiet >/dev/null 2>&1 || true
     SCHEME=http; [[ "$SSL" == "1" ]] && SCHEME=https
     wp_run option update home "${SCHEME}://${DOMAIN}" >/dev/null 2>&1 || true
@@ -3244,13 +3326,14 @@ info|list)
         if [[ "$OP" == "list" ]]; then ok '{"stagings":[],"count":0}'; fi
         ok "$(jq -cn --arg l "$DOMAIN" '{exists:false, has_staging:false, live_domain:$l}')"
     fi
-    IFS=$'\t' read -r SD SDB SST SAU SPUSH SPULL SCREATED <<< "$ROW"
+    IFS=$'\x1f' read -r SD SDB SST SAU SPUSH SPULL SCREATED SAP SSSL <<< "$ROW"
     USED=0; [[ -d "$STG_DIR" ]] && USED=$(dir_size_mb "$STG_DIR")
-    DATA=$(jq -cn --arg d "$SD" --arg st "$SST" --arg au "$SAU" --arg l "$DOMAIN" \
-        --arg pu "$SPUSH" --arg pl "$SPULL" --arg cr "$SCREATED" --argjson u "$USED" \
+    DATA=$(jq -cn --arg d "$SD" --arg st "$SST" --arg au "$SAU" --arg ap "$SAP" --arg l "$DOMAIN" \
+        --arg pu "$SPUSH" --arg pl "$SPULL" --arg cr "$SCREATED" --argjson u "$USED" --arg ssl "${SSSL:-0}" \
         '{exists:true, has_staging:true, live_domain:$l, staging_domain:$d,
           staging_url:("https://"+$d), staging_admin:("https://"+$d+"/wp-admin/"),
-          status:$st, auth_user:$au, disk_usage:$u, disk_usage_mb:$u,
+          status:$st, auth_user:$au, auth_pass:$ap, disk_usage:$u, disk_usage_mb:$u,
+          ssl_enabled:($ssl=="1"),
           last_push_at:(if $pu=="" then null else $pu end),
           last_pull_at:(if $pl=="" then null else $pl end),
           created_at:(if $cr=="" then null else $cr end)}')
@@ -3260,7 +3343,85 @@ info|list)
     ok "$DATA"
     ;;
 
+ssl)
+    [[ -n "$(stg_row)" ]] || fail "No staging environment for ${DOMAIN}"
+    log "requesting certificate for staging ${STG_DOMAIN}"
+    certbot certonly --webroot -w "$ACME_DIR" -d "$STG_DOMAIN" --cert-name "$STG_DOMAIN" \
+        --non-interactive --agree-tos --email "$ADMIN_EMAIL" --no-eff-email \
+        --keep-until-expiring --preferred-challenges http \
+        --deploy-hook /opt/flyne/scripts/ssl-deploy-hook.sh \
+        || fail "Certificate issuance failed for ${STG_DOMAIN} (is its DNS pointing at this server?)"
+    render_staging_vhost || fail "nginx rejected the staging TLS vhost"
+    db "UPDATE staging SET ssl_enabled=1 WHERE site_id=${SID}"
+    ok "$(jq -cn --arg d "$STG_DOMAIN" '{staging_domain:$d, ssl_enabled:true}')" "Staging certificate installed"
+    ;;
+
 *) fail "Unknown staging operation: ${OP}" ;;
+esac
+SCRIPT
+
+# ==================== WORDPRESS DEBUG MODE (auto-expiring) ====================
+cat > "${FLYNE_DIR}/scripts/debug-mode.sh" << 'SCRIPT'
+#!/bin/bash
+# debug-mode.sh <domain> status | enable [hours] | disable | clear
+source /opt/flyne/scripts/lib.sh
+load_site "${1:-}"
+OP="${2:-status}"
+[[ -f "${DOC_ROOT}/wp-config.php" ]] || fail "WordPress is not installed"
+LOGF="${DOC_ROOT}/wp-content/debug.log"
+EXPF="${SITE_ETC}/debug.expires"
+TIMER="flyne-debugoff-${SITE_HASH}"
+
+status_json() {
+    local v en=false exp="" sz=0
+    v=$(wp_run config get WP_DEBUG --type=constant 2>/dev/null | tr -d '[:space:]' || true)
+    [[ "$v" == "1" || "$v" == "true" ]] && en=true
+    [[ -f "$EXPF" ]] && exp=$(cat "$EXPF")
+    [[ -f "$LOGF" ]] && sz=$(stat -c%s "$LOGF")
+    jq -cn --argjson en "$en" --arg exp "$exp" --argjson sz "$sz" --argjson ex "$([[ -f "$LOGF" ]] && echo true || echo false)" \
+        '{enabled:$en, expires_at:(if $exp=="" then null else $exp end), log_exists:$ex, exists:$ex,
+          log_size:$sz,
+          log_size_formatted:(if $sz >= 1048576 then "\((($sz/1048576)*100|round)/100) MB" else "\((($sz/1024)*100|round)/100) KB" end)}'
+}
+set_const() {   # set_const NAME true|false  (adds the define if missing)
+    wp_run config set "$1" "$2" --raw --type=constant >/dev/null 2>&1 && return 0
+    runuser -u "$SITE_USER" -- sed -i "0,/<?php/s//<?php\ndefine('$1', $2);/" "${DOC_ROOT}/wp-config.php"
+}
+stop_timer() {
+    systemctl stop "${TIMER}.timer" "${TIMER}.service" >/dev/null 2>&1 || true
+    systemctl reset-failed "${TIMER}.timer" "${TIMER}.service" >/dev/null 2>&1 || true
+}
+
+case "$OP" in
+status)
+    ok "$(status_json)" ;;
+enable)
+    H="${3:-2}"; is_int "$H" || H=2
+    (( H < 1 )) && H=1
+    (( H > 72 )) && H=72
+    set_const WP_DEBUG true
+    set_const WP_DEBUG_LOG true
+    set_const WP_DEBUG_DISPLAY false
+    # debug.log must never be web-readable; the vhost denies it, keep perms tight too
+    runuser -u "$SITE_USER" -- touch "$LOGF" 2>/dev/null && chmod 640 "$LOGF" || true
+    stop_timer
+    systemd-run --quiet --collect --unit="$TIMER" --on-active="${H}h" --timer-property=AccuracySec=1min \
+        /opt/flyne/bin/flyne-agent debug-mode "$DOMAIN" disable >/dev/null 2>&1 \
+        || log "could not schedule automatic debug disable for ${DOMAIN}"
+    date -u -d "+${H} hours" '+%Y-%m-%d %H:%M:%S UTC' > "$EXPF"
+    log_activity debug_enabled "{\"hours\":${H}}" "$(site_id)"
+    ok "$(status_json)" "Debug mode enabled for ${H} hour(s)" ;;
+disable)
+    set_const WP_DEBUG false
+    set_const WP_DEBUG_LOG false
+    stop_timer
+    rm -f "$EXPF"
+    log_activity debug_disabled "{}" "$(site_id)"
+    ok "$(status_json)" "Debug mode disabled" ;;
+clear)
+    [[ -f "$LOGF" ]] && : > "$LOGF"
+    ok "$(status_json)" "Debug log cleared" ;;
+*) fail "Unknown debug operation" ;;
 esac
 SCRIPT
 
