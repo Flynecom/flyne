@@ -418,6 +418,29 @@ function fpmStatus(string $domain, bool $ssl): ?array {
 }
 
 //=============================================================================
+// PRE-AUTH: one-time download links
+// The browser opens these directly, so they cannot carry a Bearer header. The
+// 48-hex token IS the credential: single-use, 2h TTL, validated by the agent.
+//=============================================================================
+if ((string)($_GET['action'] ?? '') === 'db_download') {
+    $token = (string)($_GET['token'] ?? '');
+    if (!preg_match('/^[a-f0-9]{48}$/', $token)) apiError('Invalid download token', 400);
+    $claim = agent('download-claim', [$token], 30);
+    if (empty($claim['success'])) apiError((string)($claim['error'] ?? 'Download link is invalid or expired'), 404);
+    $d = agentData($claim);
+    $path = (string)($d['path'] ?? '');
+    if ($path === '' || !is_file($path) || !is_readable($path)) apiError('Export file is no longer available', 404);
+    header_remove('Content-Type');
+    header('Content-Type: ' . (string)($d['content_type'] ?? 'application/octet-stream'));
+    header('Content-Disposition: attachment; filename="' . basename((string)($d['file_name'] ?? 'export.sql.gz')) . '"');
+    header('Content-Length: ' . (string)($d['size_bytes'] ?? (string)filesize($path)));
+    header('X-Content-Type-Options: nosniff');
+    header('Cache-Control: no-store');
+    readfile($path);
+    exit;
+}
+
+//=============================================================================
 // MAIN ROUTER
 //=============================================================================
 authenticate($CFG);
@@ -437,6 +460,12 @@ $MUTATING = [
     'wp_search_replace', 'search_replace', 'wp_transient_delete', 'transient_delete',
     'ssl_enable', 'ssl_install', 'ssl_renew', 'maintenance_enable', 'maintenance_disable', 'option_update', 'wp_option_update',
     'site_suspend', 'site_unsuspend', 'site_limits_set', 'backup_create', 'backup_restore', 'backup_delete', 'site_render',
+    // legacy panel names + new features
+    'start_backup', 'restore_backup', 'db_export', 'auto_login',
+    'create_staging', 'delete_staging', 'push_to_live', 'pull_from_live',
+    'terminal_exec', 'terminal_wpcli',
+    'plugin_auto_update_enable', 'plugin_auto_update_disable',
+    'theme_auto_update_enable', 'theme_auto_update_disable', 'wp_auto_update_set',
 ];
 if (in_array($action, $MUTATING, true) && $method !== 'POST') {
     apiError('This action requires a POST request', 405);
@@ -1124,6 +1153,228 @@ try {
             if (!empty($sys['success'])) $info = array_merge($info, agentData($sys));
             $info['php_versions_available'] = $CFG['php_versions'] ?? [];
             apiSuccess($info);
+
+        //=====================================================================
+        // LOG VIEWERS (legacy panel names -> site_logs)
+        //=====================================================================
+        case 'access_logs':
+        case 'error_logs':
+        case 'php_error_logs':
+        case 'php_slow_logs':
+        case 'debug_log':
+            $domain = vDomain(); requireSite($domain);
+            $logMap = ['access_logs' => 'access', 'error_logs' => 'error', 'php_error_logs' => 'php-error',
+                       'php_slow_logs' => 'php-slow', 'debug_log' => 'php-error'];
+            $type = $logMap[$action];
+            $page = paramInt('page', 1, 1, 10000);
+            $perPage = paramInt('per_page', 100, 10, 500);
+            $d = agentOrFail('site-inspect', [$domain, 'logs', $type, '2000'], 'Log read failed', 60);
+            $lines = array_reverse(is_array($d['lines'] ?? null) ? $d['lines'] : []); // newest first
+            $total = count($lines);
+            $slice = array_values(array_slice($lines, ($page - 1) * $perPage, $perPage));
+            $out = ['logs' => $slice, 'lines' => $slice, 'type' => $type, 'page' => $page,
+                    'per_page' => $perPage, 'total' => $total,
+                    'total_pages' => max(1, (int)ceil($total / $perPage))];
+            if ($action === 'error_logs') {
+                $groups = [];
+                foreach ($slice as $l) {
+                    $k = preg_replace('/^\[[^\]]*\]\s*/', '', (string)$l);
+                    $k = substr((string)preg_replace('/\b\d+\b/', 'N', (string)$k), 0, 200);
+                    if (!isset($groups[$k])) $groups[$k] = ['message' => $k, 'count' => 0, 'sample' => $l];
+                    $groups[$k]['count']++;
+                }
+                usort($groups, static fn(array $a, array $b): int => $b['count'] <=> $a['count']);
+                $out['grouped'] = $groups;
+            }
+            if ($action === 'debug_log') {
+                $out['enabled'] = true;
+                $out['expires_at'] = null;
+                $out['log_size_formatted'] = $total . ' lines';
+            }
+            apiSuccess($out);
+
+        case 'logs_export':
+            $domain = vDomain(); requireSite($domain);
+            $expMap = ['access' => 'access', 'error' => 'error', 'php-error' => 'php-error',
+                       'php_error' => 'php-error', 'php-slow' => 'php-slow', 'php_slow' => 'php-slow',
+                       'php-fpm' => 'php-fpm', 'wp-cron' => 'wp-cron'];
+            $type = (string)param('type', 'error');
+            if (!isset($expMap[$type])) apiError('Invalid log type');
+            $d = agentOrFail('site-inspect', [$domain, 'logs', $expMap[$type], '2000'], 'Log export failed', 60);
+            $lines = is_array($d['lines'] ?? null) ? $d['lines'] : [];
+            apiSuccess(['content' => implode("\n", $lines), 'type' => $expMap[$type], 'lines' => count($lines)]);
+
+        //=====================================================================
+        // AUTO-UPDATES
+        //=====================================================================
+        case 'plugin_auto_update_enable':
+        case 'plugin_auto_update_disable':
+        case 'theme_auto_update_enable':
+        case 'theme_auto_update_disable':
+            $domain = vDomain(); $site = requireSite($domain);
+            $kind = str_starts_with($action, 'plugin') ? 'plugin' : 'theme';
+            $verb = str_ends_with($action, '_enable') ? 'enable' : 'disable';
+            $slug = (string)param($kind, (string)param('slug', ''));
+            $args = [$kind, 'auto-updates', $verb];
+            if ($slug === '' || $slug === 'all') $args[] = '--all';
+            else $args[] = vSlug($slug, $kind . ' slug');
+            $r = wp($domain, $args);
+            wpRequire($r, ucfirst($kind) . ' auto-update');
+            logActivity((int)$site['id'], $action, ['target' => $slug !== '' ? $slug : 'all']);
+            apiSuccess(['output' => wpOutput($r)], ucfirst($kind) . " auto-updates {$verb}d");
+
+        case 'wp_auto_update_status':
+            $domain = vDomain(); requireSite($domain);
+            $r = wp($domain, ['config', 'get', 'WP_AUTO_UPDATE_CORE', '--type=constant']);
+            $v = empty($r['success']) ? 'minor' : trim(wpOutput($r));
+            if ($v === '') $v = 'minor';
+            apiSuccess(['auto_update' => $v, 'value' => $v,
+                        'enabled' => in_array($v, ['true', '1', 'minor', 'beta', 'rc'], true)]);
+
+        case 'wp_auto_update_set':
+            $domain = vDomain(); $site = requireSite($domain);
+            $v = (string)param('value', (string)param('auto_update', 'minor'));
+            if (!in_array($v, ['true', 'false', 'minor'], true)) apiError('value must be true, false or minor');
+            $args = ['config', 'set', 'WP_AUTO_UPDATE_CORE', $v, '--type=constant'];
+            if ($v !== 'minor') $args[] = '--raw';
+            $r = wp($domain, $args);
+            wpRequire($r, 'Auto-update setting');
+            logActivity((int)$site['id'], 'wp_auto_update_set', ['value' => $v]);
+            apiSuccess(['auto_update' => $v, 'output' => wpOutput($r)], 'Core auto-update policy updated');
+
+        //=====================================================================
+        // BACKUPS (legacy panel names)
+        //=====================================================================
+        case 'start_backup':
+            $domain = vDomain(); $site = requireSite($domain);
+            $type = (string)param('type', 'full');
+            if (!in_array($type, ['full', 'files', 'database'], true)) $type = 'full';
+            $note = substr((string)param('note', 'panel'), 0, 200);
+            if (!preg_match('/^[A-Za-z0-9._ -]*$/', $note)) $note = 'panel';
+            $data = agentOrFail('backup-create', [$domain, $type, $note], 'Backup failed', 880);
+            logActivity((int)$site['id'], 'backup_created', ['type' => $type]);
+            apiSuccess($data, 'Backup completed');
+
+        case 'restore_backup':
+            $domain = vDomain(); $site = requireSite($domain);
+            $id = paramInt('backup_id', 0, 1, PHP_INT_MAX);
+            if ($id < 1) $id = paramInt('id', 0, 1, PHP_INT_MAX);
+            if ($id < 1) apiError('backup_id required');
+            $scope = (string)param('scope', (string)param('type', 'full'));
+            if (!in_array($scope, ['full', 'files', 'database'], true)) $scope = 'full';
+            $data = agentOrFail('backup-restore', [$domain, (string)$id, $scope], 'Restore failed', 880);
+            logActivity((int)$site['id'], 'backup_restored', ['backup_id' => $id, 'scope' => $scope]);
+            apiSuccess($data, 'Backup restored');
+
+        //=====================================================================
+        // DATABASE EXPORT + ONE-CLICK LOGIN
+        //=====================================================================
+        case 'db_export':
+            $domain = vDomain(); $site = requireSite($domain);
+            $d = agentOrFail('db-export', [$domain], 'Database export failed', 880);
+            $url = 'https://' . rtrim((string)($CFG['panel_domain'] ?? ''), '/')
+                 . '/?action=db_download&token=' . rawurlencode((string)($d['token'] ?? ''));
+            logActivity((int)$site['id'], 'db_export', []);
+            apiSuccess(['download_url' => $url, 'url' => $url, 'file_name' => $d['file_name'] ?? null,
+                        'size_bytes' => $d['size_bytes'] ?? 0, 'expires_in' => $d['expires_in'] ?? 7200],
+                'Database export ready');
+
+        case 'auto_login':
+            $domain = vDomain(); $site = requireSite($domain);
+            $wpUser = (string)param('user_id', (string)param('user', ''));
+            $args = [$domain];
+            if ($wpUser !== '') { if (!ctype_digit($wpUser)) apiError('user_id must be numeric'); $args[] = $wpUser; }
+            $d = agentOrFail('auto-login', $args, 'Could not create a login link', 120);
+            logActivity((int)$site['id'], 'auto_login', []);
+            apiSuccess($d, 'One-time login link created');
+
+        //=====================================================================
+        // ANALYTICS (parsed from the site's own nginx access log)
+        //=====================================================================
+        case 'site_analytics':
+        case 'visitor_stats':
+        case 'bandwidth_usage':
+        case 'performance_stats':
+            $domain = vDomain(); requireSite($domain);
+            $viewMap = ['site_analytics' => 'analytics', 'visitor_stats' => 'visitors',
+                        'bandwidth_usage' => 'bandwidth', 'performance_stats' => 'performance'];
+            $days = paramInt('days', 7, 1, 60);
+            apiSuccess(agentOrFail('site-stats', [$domain, $viewMap[$action], (string)$days], 'Statistics unavailable', 180));
+
+        //=====================================================================
+        // STAGING
+        //=====================================================================
+        case 'create_staging':
+        case 'delete_staging':
+        case 'staging_info':
+        case 'list_stagings':
+        case 'push_to_live':
+        case 'pull_from_live':
+            $domain = vDomain(); $site = requireSite($domain);
+            $opMap = ['create_staging' => 'create', 'delete_staging' => 'delete', 'staging_info' => 'info',
+                      'list_stagings' => 'list', 'push_to_live' => 'push', 'pull_from_live' => 'pull'];
+            $op = $opMap[$action];
+            $slow = in_array($op, ['create', 'push', 'pull'], true);
+            $r = agent('staging', [$domain, $op], $slow ? 880 : 120);
+            if (empty($r['success'])) apiError((string)($r['error'] ?? 'Staging operation failed'), 500);
+            if ($op !== 'info' && $op !== 'list') logActivity((int)$site['id'], 'staging_' . $op, []);
+            apiSuccess(agentData($r), (string)($r['message'] ?? 'OK'));
+
+        //=====================================================================
+        // WEB TERMINAL / FILE BROWSER
+        //=====================================================================
+        case 'terminal_exec':
+            $domain = vDomain(); requireSite($domain);
+            $cmd = (string)param('command', (string)param('cmd', ''));
+            if ($cmd === '') apiError('Command required');
+            if (strlen($cmd) > 4096) apiError('Command too long');
+            foreach (['|', '&', ';', '`', '$(', '${', '>', '<', "\n", "\r"] as $meta) {
+                if (str_contains($cmd, $meta)) apiError("Shell metacharacters are not permitted ({$meta})");
+            }
+            $argv = tokenize($cmd);
+            if (!$argv) apiError('Command required');
+            apiSuccess(agentOrFail('terminal', array_merge([$domain, 'exec', (string)param('cwd', '')], $argv),
+                'Command failed', 120));
+
+        case 'terminal_wpcli':
+            $domain = vDomain(); requireSite($domain);
+            $cmd = (string)param('command', (string)param('cmd', ''));
+            if ($cmd === '') apiError('Command required');
+            if (strlen($cmd) > 4096) apiError('Command too long');
+            $argv = tokenize((string)preg_replace('/^\s*wp\s+/', '', $cmd));
+            if (!$argv) apiError('Command required');
+            apiSuccess(agentOrFail('terminal', array_merge([$domain, 'wpcli', ''], $argv), 'WP-CLI failed', 880));
+
+        case 'terminal_files':
+            $domain = vDomain(); requireSite($domain);
+            apiSuccess(agentOrFail('terminal', [$domain, 'files', (string)param('path', '')], 'Listing failed', 60));
+
+        case 'terminal_file_read':
+            $domain = vDomain(); requireSite($domain);
+            $p = (string)param('path', (string)param('file', ''));
+            if ($p === '') apiError('Path required');
+            apiSuccess(agentOrFail('terminal', [$domain, 'read', $p], 'Read failed', 60));
+
+        case 'terminal_history':
+            $domain = vDomain(); requireSite($domain);
+            apiSuccess(agentOrFail('terminal', [$domain, 'history'], 'History unavailable', 60));
+
+        //=====================================================================
+        // COMBINED OVERVIEW (one round trip for the panel's landing tab)
+        //=====================================================================
+        case 'site_overview':
+            $domain = vDomain(); $site = requireSite($domain);
+            $out = ['site' => publicSite($site)];
+            $out['url'] = ((int)$site['ssl_enabled'] ? 'https' : 'http') . "://{$domain}";
+            $v = wp($domain, ['core', 'version'], 60);
+            $out['wp_version'] = trim(wpOutput($v));
+            $u = agent('site-inspect', [$domain, 'disk-usage'], 120);
+            if (!empty($u['success'])) $out['disk'] = agentData($u);
+            $st = agent('site-stats', [$domain, 'analytics', '7'], 120);
+            if (!empty($st['success'])) $out['analytics'] = agentData($st)['analytics'] ?? null;
+            $sg = agent('staging', [$domain, 'info'], 60);
+            if (!empty($sg['success'])) $out['staging'] = agentData($sg);
+            apiSuccess($out);
 
         //=====================================================================
         // DEFAULT

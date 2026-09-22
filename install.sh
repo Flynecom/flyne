@@ -136,7 +136,7 @@ apt-get install -y --no-install-recommends \
     jq bc pwgen htop ncdu rsync lsof net-tools dnsutils openssl \
     certbot fail2ban ufw logrotate cron \
     unattended-upgrades apt-listchanges needrestart \
-    quota python3 \
+    quota python3 libfcgi-bin \
     ssl-cert
 
 # Debconf answers so postfix does not prompt (send-only relay, no inbound mail)
@@ -250,7 +250,7 @@ mkdir -p "${FLYNE_ETC}"/{sites,api,ssl}
 mkdir -p "${SITES_DIR}" "${ACME_DIR}/.well-known/acme-challenge" "${BACKUP_DIR}" "${LOG_DIR}"
 mkdir -p /var/cache/nginx/fastcgi
 mkdir -p /etc/nginx/{flyne-sites,flyne-cache,snippets}
-mkdir -p /var/lib/flyne/pma-tmp /var/lib/mysql-files
+mkdir -p /var/lib/flyne/pma-tmp /var/lib/flyne/exports /var/lib/mysql-files
 
 chown root:root "${FLYNE_DIR}" "${FLYNE_DIR}"/{bin,scripts,templates}
 chmod 755 "${FLYNE_DIR}" "${FLYNE_DIR}"/{bin,templates}
@@ -272,6 +272,7 @@ chown root:adm "${LOG_DIR}"/agent.log "${LOG_DIR}"/cron.log; chmod 640 "${LOG_DI
 chown flyne-api:adm "${LOG_DIR}"/api.log "${LOG_DIR}"/auth.log; chmod 640 "${LOG_DIR}"/api.log "${LOG_DIR}"/auth.log
 chown www-data:www-data /var/cache/nginx/fastcgi; chmod 700 /var/cache/nginx/fastcgi
 chown flyne-pma:flyne-pma /var/lib/flyne/pma-tmp; chmod 700 /var/lib/flyne/pma-tmp
+chown root:flyne-api /var/lib/flyne/exports; chmod 750 /var/lib/flyne/exports
 chown mysql:mysql /var/lib/mysql-files; chmod 700 /var/lib/mysql-files
 
 #===============================================================================
@@ -425,6 +426,55 @@ CREATE TABLE IF NOT EXISTS backups (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at DATETIME NULL,
     INDEX idx_site (site_id),
+    FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- Staging environments: one per site, sharing the parent's Linux user and
+-- PHP-FPM pool (same tenant) but with its own docroot, database and vhost.
+CREATE TABLE IF NOT EXISTS staging (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    site_id INT NOT NULL UNIQUE,
+    staging_domain VARCHAR(253) NOT NULL UNIQUE,
+    install_path VARCHAR(500) NOT NULL,
+    db_name VARCHAR(64) NOT NULL,
+    db_user VARCHAR(64) NOT NULL,
+    db_pass VARCHAR(255) NOT NULL,
+    auth_user VARCHAR(64) NULL,
+    auth_pass VARCHAR(255) NULL,
+    status ENUM('creating','active','syncing','error') NOT NULL DEFAULT 'creating',
+    ssl_enabled TINYINT(1) NOT NULL DEFAULT 0,
+    last_push_at DATETIME NULL,
+    last_pull_at DATETIME NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- Web terminal command history (per site)
+CREATE TABLE IF NOT EXISTS terminal_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    site_id INT NOT NULL,
+    command VARCHAR(2000) NOT NULL,
+    exit_code INT NULL,
+    cwd VARCHAR(500) NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_site_created (site_id, created_at),
+    FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- One-time download tokens (database exports, log exports). The token IS the
+-- credential, so rows are short-lived and single-use.
+CREATE TABLE IF NOT EXISTS download_tokens (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    token CHAR(48) NOT NULL UNIQUE,
+    site_id INT NOT NULL,
+    file_path VARCHAR(500) NOT NULL,
+    file_name VARCHAR(255) NOT NULL,
+    content_type VARCHAR(100) NOT NULL DEFAULT 'application/octet-stream',
+    used TINYINT(1) NOT NULL DEFAULT 0,
+    expires_at DATETIME NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_expires (expires_at),
     FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 SCHEMA
@@ -757,7 +807,8 @@ ACTION="${1:-}"; shift || true
 case "$ACTION" in
     create-site|delete-site|render-site|php-switch|php-restart|sftp-enable|sftp-disable|\
     cache-purge|wp-cli|ssl-issue|ssl-status|backup-create|backup-list|backup-restore|\
-    backup-delete|site-suspend|site-unsuspend|site-limits|site-inspect|system-check) ;;
+    backup-delete|site-suspend|site-unsuspend|site-limits|site-inspect|system-check|\
+    site-stats|staging|terminal|db-export|auto-login|download-claim) ;;
     *) deny "Unknown agent action" ;;
 esac
 
@@ -898,6 +949,23 @@ http {
         "0000"  0;
     }
 
+    # --- CDN / proxy awareness -------------------------------------------------
+    # Never redirect to HTTPS a request the edge already served over TLS: with
+    # Cloudflare in Flexible mode the edge speaks HTTP to us, and redirecting
+    # would loop forever. Never redirect an ACME challenge either.
+    map $http_x_forwarded_proto $flyne_need_https {
+        default 1;
+        https   0;
+    }
+    map $request_uri $flyne_is_acme {
+        default 0;
+        ~^/\.well-known/acme-challenge/ 1;
+    }
+    map "$flyne_need_https$flyne_is_acme" $flyne_do_redirect {
+        default 0;
+        "10"    1;
+    }
+
     # --- abuse limits (per client IP, shared zones) ---
     limit_req_zone  $binary_remote_addr zone=flyne_login:16m  rate=10r/m;
     limit_req_zone  $binary_remote_addr zone=flyne_xmlrpc:16m rate=30r/m;
@@ -931,6 +999,7 @@ location ^~ /.well-known/acme-challenge/ {
     root /var/www/acme;
     default_type "text/plain";
     allow all;
+    auth_basic off;
     access_log off;
 }
 SNIP
@@ -1075,7 +1144,7 @@ clear_env = yes
 security.limit_extensions = .php
 chdir = /opt/flyne/api
 env[PATH] = /usr/local/bin:/usr/bin:/bin
-php_admin_value[open_basedir] = /opt/flyne/api/:/etc/flyne/api/:/var/log/flyne/:/run/flyne-php/:/run/mysqld/:/proc/meminfo:/proc/loadavg:/proc/uptime:/proc/cpuinfo:/tmp/
+php_admin_value[open_basedir] = /opt/flyne/api/:/etc/flyne/api/:/var/log/flyne/:/var/lib/flyne/exports/:/run/flyne-php/:/run/mysqld/:/proc/meminfo:/proc/loadavg:/proc/uptime:/proc/cpuinfo:/tmp/
 php_admin_value[disable_functions] = exec,system,passthru,shell_exec,popen,pcntl_exec,pcntl_fork,dl,putenv,ini_alter
 php_admin_value[error_log] = /var/log/flyne/api.log
 php_admin_flag[log_errors] = on
@@ -1564,6 +1633,21 @@ EOF
     chmod 644 "$CRON_FILE"
 }
 
+# A site must answer TLS on :443 from the moment it exists. Cloudflare and every
+# other CDN connect to the origin over HTTPS; if no 443 server matches the host,
+# nginx falls through to the catch-all that closes the connection and the edge
+# reports "SSL handshake failed" (Cloudflare error 525). So we serve a self-signed
+# certificate until Let's Encrypt issues the real one.
+ensure_selfsigned() {
+    local crt="${FLYNE_ETC}/ssl/${DOMAIN}.crt" k="${FLYNE_ETC}/ssl/${DOMAIN}.key"
+    [[ -s "$crt" && -s "$k" ]] && return 0
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
+        -subj "/CN=${DOMAIN}" -addext "subjectAltName=DNS:${DOMAIN},DNS:www.${DOMAIN}" \
+        -keyout "$k" -out "$crt" >/dev/null 2>&1 || return 1
+    chmod 600 "$k"; chmod 644 "$crt"
+    return 0
+}
+
 # Writes the nginx vhost. Rolls back and fails if the resulting config does not pass nginx -t,
 # so a single site can never leave nginx in an unreloadable state.
 render_nginx_apply() {
@@ -1654,6 +1738,19 @@ ${cache_block}
     }"
     fi
 
+    # :443 always exists. Real certificate when we have one, self-signed until then.
+    local ssl_cert="$cert" ssl_key="$key"
+    if (( ! has_ssl )); then
+        if ensure_selfsigned; then
+            ssl_cert="${FLYNE_ETC}/ssl/${DOMAIN}.crt"
+            ssl_key="${FLYNE_ETC}/ssl/${DOMAIN}.key"
+        else
+            log "warning: self-signed certificate generation failed for ${DOMAIN}, using platform default"
+            ssl_cert="${FLYNE_ETC}/ssl/default.crt"
+            ssl_key="${FLYNE_ETC}/ssl/default.key"
+        fi
+    fi
+
     local tmp="${NGX_CONF}.tmp" bak="${NGX_CONF}.rollback"
     {
         echo "# managed by Flyne render-site - DO NOT EDIT (regenerated automatically)"
@@ -1661,25 +1758,24 @@ ${cache_block}
         echo "    listen 80;"
         echo "    listen [::]:80;"
         echo "    server_name ${names};"
+        # Redirect to HTTPS only once a real certificate exists, and never for ACME
+        # or for a request the CDN already terminated over TLS (Flexible-mode loop).
         if (( has_ssl )); then
-            echo "    include snippets/flyne-acme.conf;"
-            [[ -n "$purge_block" ]] && echo "$purge_block"
-            echo "    location / { return 301 https://\$host\$request_uri; }"
-        else
-            echo "$body"
+            echo "    if (\$flyne_do_redirect) { return 301 https://\$host\$request_uri; }"
         fi
+        echo "$body"
         echo "}"
+        echo "server {"
+        echo "    listen 443 ssl http2;"
+        echo "    listen [::]:443 ssl http2;"
+        echo "    server_name ${names};"
+        echo "    ssl_certificate ${ssl_cert};"
+        echo "    ssl_certificate_key ${ssl_key};"
         if (( has_ssl )); then
-            echo "server {"
-            echo "    listen 443 ssl http2;"
-            echo "    listen [::]:443 ssl http2;"
-            echo "    server_name ${names};"
-            echo "    ssl_certificate ${cert};"
-            echo "    ssl_certificate_key ${key};"
             echo "    include snippets/flyne-hsts.conf;"
-            echo "$body"
-            echo "}"
         fi
+        echo "$body"
+        echo "}"
     } > "$tmp"
 
     [[ -f "$NGX_CONF" ]] && cp -f "$NGX_CONF" "$bak"
@@ -1958,6 +2054,17 @@ rm -f "$NGX_CONF" "$NGX_ZONE_CONF" "$CRON_FILE"
 if nginx -t; then systemctl reload nginx; else log "nginx -t failed after removing ${DOMAIN} - check /etc/nginx/flyne-sites"; fi
 rm -rf "$CACHE_PATH"
 certbot delete --cert-name "$DOMAIN" --non-interactive >/dev/null 2>&1 || true
+rm -f "${FLYNE_ETC}/ssl/${DOMAIN}.crt" "${FLYNE_ETC}/ssl/${DOMAIN}.key"
+
+# staging environment (its DB and vhost are not covered by the FK cascade)
+STG_DOMAIN="staging.${DOMAIN}"
+if [[ -n "$SID" ]]; then
+    STG_DB=$(db "SELECT IFNULL(db_name,'') FROM staging WHERE site_id=${SID}")
+    [[ "$STG_DB" =~ ^stg_[a-z0-9_]+$ ]] && mysql -e "DROP DATABASE IF EXISTS \`${STG_DB}\`;" 2>/dev/null || true
+fi
+rm -f "${NGX_SITES}/${DOMAIN}-staging.conf" "${SITE_ETC}/staging.htpasswd"
+rm -f "${FLYNE_ETC}/ssl/${STG_DOMAIN}.crt" "${FLYNE_ETC}/ssl/${STG_DOMAIN}.key"
+certbot delete --cert-name "$STG_DOMAIN" --non-interactive >/dev/null 2>&1 || true
 
 # database
 if [[ -n "$SID" ]]; then
@@ -2683,6 +2790,592 @@ chmod 640 /etc/flyne/api/config.php
 ok "$(jq -cn --argjson t "$TLS" '{panel_tls:$t}')" "Panel vhosts rendered"
 SCRIPT
 
+# ==================== SITE STATS (analytics / performance / bandwidth) ====================
+# Everything is derived from the site's own nginx access log, so there is no
+# tracking code in the site and no third-party service involved.
+cat > "${FLYNE_DIR}/scripts/site-stats.sh" << 'SCRIPT'
+#!/bin/bash
+# site-stats.sh <domain> [analytics|performance|bandwidth|visitors] [days]
+source /opt/flyne/scripts/lib.sh
+load_site "${1:-}"
+WHAT="${2:-analytics}"
+DAYS="${3:-7}"
+is_int "$DAYS" || DAYS=7
+(( DAYS < 1 )) && DAYS=1
+(( DAYS > 60 )) && DAYS=60
+case "$WHAT" in analytics|performance|bandwidth|visitors) ;; *) fail "Unknown stats view" ;; esac
+
+# nginx stamps requests as [22/Sep/2026:10:00:00 +0000]; match on the day part.
+DRE=""
+for (( i=0; i<DAYS; i++ )); do DRE="${DRE}|$(date -u -d "-${i} day" +%d/%b/%Y)"; done
+DRE="${DRE#|}"
+
+read_logs() {
+    local f
+    [[ -f "${LOGS_DIR}/access.log" ]] && cat -- "${LOGS_DIR}/access.log"
+    for f in "${LOGS_DIR}"/access.log.[0-9]* "${LOGS_DIR}"/access.log-[0-9]*; do
+        [[ -e "$f" ]] || continue
+        case "$f" in *.gz) zcat -- "$f" 2>/dev/null ;; *) cat -- "$f" ;; esac
+    done
+    return 0
+}
+
+# Log format "flyne": ip - user [date tz] "METHOD path PROTO" status bytes "ref" "ua" rt=.. urt=.. cache=..
+# The last three fields are always rt/urt/cache, whatever the user agent contains.
+TSV=$(read_logs 2>/dev/null | awk -v dre="$DRE" '
+    index($4, "[") == 1 && $4 ~ dre {
+        req++
+        ip[$1] = 1
+        st = $9 + 0
+        by = $10 + 0
+        bytes += by
+        if (st >= 500) s5xx++; else if (st >= 400) s4xx++; else if (st >= 300) s3xx++; else if (st >= 200) s2xx++
+        c = $NF; sub(/^cache=/, "", c)
+        if (c == "HIT") hit++; else if (c != "-" && c != "") miss++
+        r = $(NF-2); sub(/^rt=/, "", r); r = r + 0
+        if (r > 0) { rtsum += r; rtn++; if (r > slow_t) slow++ }
+        m = $6; sub(/^"/, "", m)
+        meth[m]++
+        p = $7; sub(/\?.*$/, "", p)
+        if (length(p) > 0 && length(p) <= 200) page[p]++
+        d = substr($4, 2, 11)
+        dreq[d]++; dbytes[d] += by
+        if (!( (d SUBSEP $1) in dseen )) { dseen[d SUBSEP $1] = 1; dvis[d]++ }
+        b = $1
+        botq = tolower($0)
+        if (botq ~ /bot|crawl|spider|slurp/) bots++
+    }
+    BEGIN { slow_t = 1.0 }
+    END {
+        u = 0; for (k in ip) u++
+        printf "T\trequests\t%d\n", req + 0
+        printf "T\tbytes\t%d\n", bytes + 0
+        printf "T\tvisitors\t%d\n", u
+        printf "T\tstatus_2xx\t%d\n", s2xx + 0
+        printf "T\tstatus_3xx\t%d\n", s3xx + 0
+        printf "T\tstatus_4xx\t%d\n", s4xx + 0
+        printf "T\tstatus_5xx\t%d\n", s5xx + 0
+        printf "T\tcache_hit\t%d\n", hit + 0
+        printf "T\tcache_miss\t%d\n", miss + 0
+        printf "T\tslow_requests\t%d\n", slow + 0
+        printf "T\tbot_requests\t%d\n", bots + 0
+        printf "T\tavg_ms\t%d\n", (rtn > 0 ? (rtsum / rtn) * 1000 : 0)
+        for (k in page) printf "P\t%s\t%d\n", k, page[k]
+        for (k in dreq)  printf "D\t%s\t%d\t%d\t%d\n", k, dreq[k], dbytes[k], dvis[k]
+        for (k in meth)  printf "M\t%s\t%d\n", k, meth[k]
+    }
+' || true)
+
+JSON=$(printf '%s\n' "$TSV" | jq -Rn --argjson days "$DAYS" '
+    [inputs | select(length > 0) | split("\t")] as $rows
+    | ($rows | map(select(.[0] == "T")) | map({key: .[1], value: (.[2] | tonumber)}) | from_entries) as $t
+    | ($rows | map(select(.[0] == "P")) | map({path: .[1], hits: (.[2] | tonumber)})
+        | sort_by(-.hits) | .[0:25]) as $pages
+    | ($rows | map(select(.[0] == "D")) | map({date: .[1], requests: (.[2] | tonumber),
+        bytes: (.[3] | tonumber), visitors: (.[4] | tonumber)}) | sort_by(.date)) as $daily
+    | ($rows | map(select(.[0] == "M")) | map({key: .[1], value: (.[2] | tonumber)}) | from_entries) as $methods
+    | (($t.cache_hit // 0) + ($t.cache_miss // 0)) as $cacheable
+    | {
+        period_days: $days,
+        requests: ($t.requests // 0),
+        visitors: ($t.visitors // 0),
+        bytes: ($t.bytes // 0),
+        bandwidth_mb: (((($t.bytes // 0) / 1048576) * 100 | round) / 100),
+        avg_response_ms: ($t.avg_ms // 0),
+        slow_requests: ($t.slow_requests // 0),
+        bot_requests: ($t.bot_requests // 0),
+        cache_hit_rate: (if $cacheable > 0 then ((($t.cache_hit // 0) * 1000 / $cacheable | round) / 10) else 0 end),
+        status: { "2xx": ($t.status_2xx // 0), "3xx": ($t.status_3xx // 0),
+                  "4xx": ($t.status_4xx // 0), "5xx": ($t.status_5xx // 0) },
+        methods: $methods,
+        top_pages: $pages,
+        daily: $daily
+      }')
+
+case "$WHAT" in
+    bandwidth)
+        ok "$(jq -cn --argjson j "$JSON" '{used_mb: $j.bandwidth_mb, bytes: $j.bytes,
+              period_days: $j.period_days, daily: [$j.daily[] | {date, mb: ((.bytes / 1048576 * 100 | round) / 100)}]}')" ;;
+    visitors)
+        ok "$(jq -cn --argjson j "$JSON" '{visitors: $j.visitors, requests: $j.requests,
+              bot_requests: $j.bot_requests, period_days: $j.period_days, daily: $j.daily}')" ;;
+    performance)
+        FPM=$(runuser -u www-data -- env SCRIPT_NAME=/flyne-fpm-status SCRIPT_FILENAME=/flyne-fpm-status \
+                QUERY_STRING=json REQUEST_METHOD=GET \
+                cgi-fcgi -bind -connect "$PHP_SOCK" 2>/dev/null | sed -n '/{/,$p' || true)
+        jq -e . >/dev/null 2>&1 <<< "$FPM" || FPM='{}'
+        ok "$(jq -cn --argjson j "$JSON" --argjson f "$FPM" \
+              '{avg_response_ms: $j.avg_response_ms, slow_requests: $j.slow_requests,
+                cache_hit_rate: $j.cache_hit_rate, requests: $j.requests,
+                status: $j.status, period_days: $j.period_days, php_fpm: $f}')" ;;
+    analytics)
+        ok "$(jq -cn --argjson j "$JSON" '{analytics: $j}')" ;;
+esac
+SCRIPT
+
+# ==================== DATABASE EXPORT (one-time download token) ====================
+cat > "${FLYNE_DIR}/scripts/db-export.sh" << 'SCRIPT'
+#!/bin/bash
+# db-export.sh <domain>
+source /opt/flyne/scripts/lib.sh
+load_site "${1:-}"
+SID=$(site_id); [[ -n "$SID" ]] || fail "Site is not registered"
+DBN=$(db "SELECT IFNULL(db_name,'') FROM sites WHERE id=${SID}")
+[[ "$DBN" =~ ^wp_[a-z0-9_]+$ ]] || fail "Site has no database"
+
+# Exports live outside the site tree so the API user can stream them without
+# being granted read access to any customer's files.
+EXPORT_DIR=/var/lib/flyne/exports
+mkdir -p "$EXPORT_DIR"
+chown root:flyne-api "$EXPORT_DIR"; chmod 750 "$EXPORT_DIR"
+find "$EXPORT_DIR" -type f -mmin +120 -delete 2>/dev/null || true
+
+TOKEN=$(head -c 4096 /dev/urandom | tr -dc 'a-f0-9' | head -c 48)
+FILE="${EXPORT_DIR}/${TOKEN}.sql.gz"
+NAME="${DOMAIN}-$(date -u +%Y%m%d-%H%M%S).sql.gz"
+
+nice -n 10 mysqldump --single-transaction --quick --routines --triggers --default-character-set=utf8mb4 \
+    "$DBN" 2>/dev/null | gzip -6 > "$FILE" || { rm -f "$FILE"; fail "Database export failed"; }
+chown root:flyne-api "$FILE"; chmod 640 "$FILE"
+SIZE=$(stat -c%s "$FILE")
+
+db "DELETE FROM download_tokens WHERE expires_at < NOW()" || true
+db "INSERT INTO download_tokens (token, site_id, file_path, file_name, content_type, expires_at)
+    VALUES ('${TOKEN}', ${SID}, '$(sql_esc "$FILE")', '$(sql_esc "$NAME")', 'application/gzip',
+            DATE_ADD(NOW(), INTERVAL 2 HOUR))"
+log_activity db_exported "{\"size\":${SIZE}}" "$SID"
+ok "$(jq -cn --arg t "$TOKEN" --arg n "$NAME" --argjson s "$SIZE" \
+    '{token: $t, file_name: $n, size_bytes: $s, expires_in: 7200}')" "Database export ready"
+SCRIPT
+
+# ==================== DOWNLOAD CLAIM (validates a one-time token) ====================
+cat > "${FLYNE_DIR}/scripts/download-claim.sh" << 'SCRIPT'
+#!/bin/bash
+# download-claim.sh <token>     - validates, marks used, prints the file to stream
+source /opt/flyne/scripts/lib.sh
+TOKEN="${1:-}"
+[[ "$TOKEN" =~ ^[a-f0-9]{48}$ ]] || fail "Invalid download token"
+db "DELETE FROM download_tokens WHERE expires_at < NOW()" || true
+ROW=$(db "SELECT file_path, file_name, content_type FROM download_tokens
+          WHERE token='${TOKEN}' AND used=0 AND expires_at > NOW()")
+[[ -n "$ROW" ]] || fail "Download link is invalid or has expired"
+IFS=$'\t' read -r FPATH FNAME CTYPE <<< "$ROW"
+[[ -f "$FPATH" && "$FPATH" == /var/lib/flyne/exports/* ]] || fail "Export file is no longer available"
+db "UPDATE download_tokens SET used=1 WHERE token='${TOKEN}'"
+ok "$(jq -cn --arg p "$FPATH" --arg n "$FNAME" --arg c "$CTYPE" --argjson s "$(stat -c%s "$FPATH")" \
+    '{path: $p, file_name: $n, content_type: $c, size_bytes: $s}')"
+SCRIPT
+
+# ==================== AUTO-LOGIN (one-time wp-admin magic link) ====================
+cat > "${FLYNE_DIR}/scripts/auto-login.sh" << 'SCRIPT'
+#!/bin/bash
+# auto-login.sh <domain> [wp_user]
+source /opt/flyne/scripts/lib.sh
+load_site "${1:-}"
+WPUSER="${2:-}"
+[[ "$SUSPENDED" == "1" ]] && fail "Site is suspended"
+[[ -f "${DOC_ROOT}/wp-config.php" ]] || fail "WordPress is not installed"
+
+if [[ -z "$WPUSER" ]]; then
+    WPUSER=$(wp_run user list --role=administrator --field=ID --number=1 2>/dev/null | head -1 | tr -d '[:space:]')
+fi
+[[ "$WPUSER" =~ ^[0-9]+$ ]] || fail "No administrator account found on this site"
+
+MU_DIR="${DOC_ROOT}/wp-content/mu-plugins"
+runuser -u "$SITE_USER" -- mkdir -p "$MU_DIR"
+cat > "${MU_DIR}/flyne-autologin.php" << 'PHPEOF'
+<?php
+/**
+ * Plugin Name: Flyne Auto Login
+ * Description: Consumes a single-use token issued by the Flyne control panel. Managed file - do not edit.
+ */
+add_action('init', function () {
+    if (empty($_GET['flyne_login']) || is_user_logged_in()) { return; }
+    $token = (string) $_GET['flyne_login'];
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) { return; }
+    $users = get_users([
+        'meta_key'   => '_flyne_login_token',
+        'meta_value' => hash('sha256', $token),
+        'number'     => 1,
+    ]);
+    if (empty($users)) { return; }
+    $user = $users[0];
+    $expires = (int) get_user_meta($user->ID, '_flyne_login_expires', true);
+    delete_user_meta($user->ID, '_flyne_login_token');
+    delete_user_meta($user->ID, '_flyne_login_expires');
+    if ($expires < time()) { return; }
+    wp_set_auth_cookie($user->ID, false, is_ssl());
+    wp_safe_redirect(admin_url());
+    exit;
+}, 1);
+PHPEOF
+chown "$SITE_USER:$SITE_USER" "${MU_DIR}/flyne-autologin.php"
+chmod 640 "${MU_DIR}/flyne-autologin.php"
+
+TOKEN=$(head -c 4096 /dev/urandom | tr -dc 'a-f0-9' | head -c 64)
+HASH=$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)
+wp_run user meta update "$WPUSER" _flyne_login_token "$HASH" >/dev/null 2>&1 || fail "Could not issue login token"
+wp_run user meta update "$WPUSER" _flyne_login_expires "$(( $(date +%s) + 120 ))" >/dev/null 2>&1 || true
+SCHEME=http; [[ "$SSL" == "1" ]] && SCHEME=https
+log_activity auto_login "{\"user\":\"${WPUSER}\"}" "$(site_id)"
+ok "$(jq -cn --arg u "${SCHEME}://${DOMAIN}/?flyne_login=${TOKEN}" --arg id "$WPUSER" \
+    '{login_url: $u, url: $u, user_id: $id, expires_in: 120}')" "One-time login link created"
+SCRIPT
+
+# ==================== STAGING ENVIRONMENTS ====================
+# A staging site belongs to the SAME tenant: same Linux user, same PHP-FPM pool
+# and cgroup budget, living under the parent's directory. Only the docroot,
+# the database and the vhost are separate. That keeps isolation intact and
+# means staging cannot be used to double a customer's resource allocation.
+cat > "${FLYNE_DIR}/scripts/staging.sh" << 'SCRIPT'
+#!/bin/bash
+# staging.sh <domain> create|delete|info|list|push|pull [--yes]
+source /opt/flyne/scripts/lib.sh
+load_site "${1:-}"
+OP="${2:-info}"
+SID=$(site_id); [[ -n "$SID" ]] || fail "Site is not registered"
+
+STG_DOMAIN="staging.${DOMAIN}"
+STG_DIR="${SITE_DIR}/staging"
+STG_DOC="${STG_DIR}/public"
+STG_DB="stg_${SITE_HASH:0:10}"
+STG_CONF="${NGX_SITES}/${DOMAIN}-staging.conf"
+HTPASSWD="${SITE_ETC}/staging.htpasswd"
+
+wp_stg() {
+    runuser -u "$SITE_USER" -- env -i \
+        HOME="$SITE_DIR" PATH=/usr/local/bin:/usr/bin:/bin TMPDIR="$TMP_DIR" LC_ALL=C.UTF-8 \
+        WP_CLI_CACHE_DIR="${TMP_DIR}/wp-cli-cache" WP_CLI_DISABLE_AUTO_CHECK_UPDATE=1 \
+        timeout 900 "/usr/bin/php${PHP_VERSION}" -d memory_limit=512M -d max_execution_time=0 \
+        /usr/local/bin/wp --path="$STG_DOC" --no-color "$@"
+}
+stg_row() { db "SELECT staging_domain, db_name, status, auth_user, IFNULL(DATE_FORMAT(last_push_at,'%Y-%m-%dT%H:%i:%sZ'),''), IFNULL(DATE_FORMAT(last_pull_at,'%Y-%m-%dT%H:%i:%sZ'),''), IFNULL(DATE_FORMAT(created_at,'%Y-%m-%dT%H:%i:%sZ'),'') FROM staging WHERE site_id=${SID}"; }
+
+render_staging_vhost() {
+    local cert="/etc/letsencrypt/live/${STG_DOMAIN}/fullchain.pem" key="/etc/letsencrypt/live/${STG_DOMAIN}/privkey.pem"
+    local has=0; [[ -s "$cert" && -s "$key" ]] && has=1
+    if (( ! has )); then
+        if [[ ! -s "${FLYNE_ETC}/ssl/${STG_DOMAIN}.crt" ]]; then
+            openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
+                -subj "/CN=${STG_DOMAIN}" -addext "subjectAltName=DNS:${STG_DOMAIN}" \
+                -keyout "${FLYNE_ETC}/ssl/${STG_DOMAIN}.key" -out "${FLYNE_ETC}/ssl/${STG_DOMAIN}.crt" >/dev/null 2>&1 || true
+            chmod 600 "${FLYNE_ETC}/ssl/${STG_DOMAIN}.key" 2>/dev/null || true
+        fi
+        cert="${FLYNE_ETC}/ssl/${STG_DOMAIN}.crt"; key="${FLYNE_ETC}/ssl/${STG_DOMAIN}.key"
+    fi
+    local body="    root ${STG_DOC};
+    index index.php index.html;
+    access_log ${LOGS_DIR}/staging-access.log flyne buffer=16k flush=5s;
+    error_log ${LOGS_DIR}/staging-error.log warn;
+    client_max_body_size ${PHP_UPLOAD_MB}m;
+    add_header X-Robots-Tag \"noindex, nofollow, noarchive, nosnippet\" always;
+    auth_basic \"Staging environment\";
+    auth_basic_user_file ${HTPASSWD};
+
+    include snippets/flyne-acme.conf;
+    include snippets/flyne-wp-hardening.conf;
+
+    location / { try_files \$uri \$uri/ /index.php?\$args; }
+    location ~ \\.php\$ {
+        try_files \$uri =404;
+        include snippets/flyne-php.conf;
+        fastcgi_pass unix:${PHP_SOCK};
+    }"
+    local tmp="${STG_CONF}.tmp" bak="${STG_CONF}.rollback"
+    {
+        echo "# managed by Flyne staging - DO NOT EDIT"
+        echo "server {"; echo "    listen 80;"; echo "    listen [::]:80;"
+        echo "    server_name ${STG_DOMAIN};"; echo "$body"; echo "}"
+        echo "server {"; echo "    listen 443 ssl http2;"; echo "    listen [::]:443 ssl http2;"
+        echo "    server_name ${STG_DOMAIN};"
+        echo "    ssl_certificate ${cert};"; echo "    ssl_certificate_key ${key};"
+        echo "$body"; echo "}"
+    } > "$tmp"
+    [[ -f "$STG_CONF" ]] && cp -f "$STG_CONF" "$bak"
+    mv -f "$tmp" "$STG_CONF"
+    if ! nginx -t; then
+        if [[ -f "$bak" ]]; then mv -f "$bak" "$STG_CONF"; else rm -f "$STG_CONF"; fi
+        nginx -t >/dev/null 2>&1 || log "nginx still broken after staging rollback"
+        return 1
+    fi
+    rm -f "$bak"; systemctl reload nginx
+}
+
+sync_live_to_staging() {
+    log "syncing live -> staging for ${DOMAIN}"
+    runuser -u "$SITE_USER" -- mkdir -p "$STG_DOC"
+    rsync -a --delete \
+        --exclude='wp-content/cache/' --exclude='wp-content/upgrade/' \
+        --exclude='wp-content/uploads/cache/' --exclude='.git/' \
+        "${DOC_ROOT}/" "${STG_DOC}/" || return 1
+    local live_db; live_db=$(db "SELECT db_name FROM sites WHERE id=${SID}")
+    mysqldump --single-transaction --quick --routines --triggers --default-character-set=utf8mb4 \
+        "$live_db" 2>/dev/null | mysql "$STG_DB" || return 1
+    local stg_pass; stg_pass=$(db "SELECT db_pass FROM staging WHERE site_id=${SID}")
+    local stg_user; stg_user=$(db "SELECT db_user FROM staging WHERE site_id=${SID}")
+    runuser -u "$SITE_USER" -- sed -i \
+        -e "s/define( *'DB_NAME'.*/define('DB_NAME', '${STG_DB}');/" \
+        -e "s/define( *'DB_USER'.*/define('DB_USER', '${stg_user}');/" \
+        -e "s/define( *'DB_PASSWORD'.*/define('DB_PASSWORD', '${stg_pass}');/" \
+        "${STG_DOC}/wp-config.php" || return 1
+    wp_stg search-replace "//${DOMAIN}" "//${STG_DOMAIN}" --all-tables-with-prefix --skip-columns=guid --quiet >/dev/null 2>&1 || true
+    wp_stg option update home "https://${STG_DOMAIN}" >/dev/null 2>&1 || true
+    wp_stg option update siteurl "https://${STG_DOMAIN}" >/dev/null 2>&1 || true
+    wp_stg option update blog_public 0 >/dev/null 2>&1 || true
+    wp_stg cache flush >/dev/null 2>&1 || true
+    chown -R "$SITE_USER:$SITE_USER" "$STG_DIR"
+    find "$STG_DOC" -type d -exec chmod 2750 {} + 2>/dev/null || true
+    find "$STG_DOC" -type f -exec chmod 640 {} + 2>/dev/null || true
+    chmod 600 "${STG_DOC}/wp-config.php" 2>/dev/null || true
+    return 0
+}
+
+case "$OP" in
+
+create)
+    [[ -n "$(stg_row)" ]] && fail "Staging already exists for ${DOMAIN}"
+    [[ "$SUSPENDED" == "1" ]] && fail "Site is suspended"
+    [[ -f "${DOC_ROOT}/wp-config.php" ]] || fail "WordPress is not installed on the live site"
+    LIVE_DBU=$(db "SELECT db_user FROM sites WHERE id=${SID}")
+    LIVE_DBP=$(db "SELECT db_pass FROM sites WHERE id=${SID}")
+    [[ "$LIVE_DBU" =~ ^u_[a-f0-9]+$ ]] || fail "Site has no database user"
+    AUTH_USER="staging"
+    AUTH_PASS=$(rand_alnum 16)
+
+    mysql -e "CREATE DATABASE IF NOT EXISTS \`${STG_DB}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+              GRANT ALL PRIVILEGES ON \`${STG_DB}\`.* TO '${LIVE_DBU}'@'localhost'; FLUSH PRIVILEGES;" \
+        || fail "Could not create the staging database"
+
+    db "INSERT INTO staging (site_id, staging_domain, install_path, db_name, db_user, db_pass, auth_user, auth_pass, status)
+        VALUES (${SID}, '$(sql_esc "$STG_DOMAIN")', '$(sql_esc "$STG_DOC")', '${STG_DB}', '${LIVE_DBU}',
+                '$(sql_esc "$LIVE_DBP")', '${AUTH_USER}', '$(sql_esc "$AUTH_PASS")', 'creating')"
+
+    printf '%s:%s\n' "$AUTH_USER" "$(openssl passwd -apr1 "$AUTH_PASS")" > "$HTPASSWD"
+    chown root:www-data "$HTPASSWD"; chmod 640 "$HTPASSWD"
+
+    if ! sync_live_to_staging; then
+        db "UPDATE staging SET status='error' WHERE site_id=${SID}"
+        fail "Staging copy failed (details in ${AGENT_LOG})"
+    fi
+    render_staging_vhost || { db "UPDATE staging SET status='error' WHERE site_id=${SID}"; fail "nginx rejected the staging vhost"; }
+    db "UPDATE staging SET status='active' WHERE site_id=${SID}"
+    log_activity staging_created "{\"staging_domain\":\"${STG_DOMAIN}\"}" "$SID"
+    systemd-run --quiet --no-block --collect --unit="flyne-stgssl-${SITE_HASH}-$(date +%s)" \
+        /opt/flyne/scripts/ssl-issue.sh "$STG_DOMAIN" >/dev/null 2>&1 || true
+    ok "$(jq -cn --arg d "$STG_DOMAIN" --arg u "https://${STG_DOMAIN}" --arg au "$AUTH_USER" --arg ap "$AUTH_PASS" \
+        '{staging_domain:$d, staging_url:$u, url:$u, staging_admin:($u+"/wp-admin/"),
+          auth_user:$au, auth_pass:$ap, status:"active"}')" "Staging environment created"
+    ;;
+
+delete)
+    [[ -n "$(stg_row)" ]] || fail "No staging environment for ${DOMAIN}"
+    systemctl is-active --quiet nginx && true
+    rm -f "$STG_CONF"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx || log "nginx -t failed after removing staging vhost"
+    mysql -e "DROP DATABASE IF EXISTS \`${STG_DB}\`;" 2>/dev/null || true
+    rm -rf "$STG_DIR" "$HTPASSWD"
+    rm -f "${FLYNE_ETC}/ssl/${STG_DOMAIN}.crt" "${FLYNE_ETC}/ssl/${STG_DOMAIN}.key"
+    certbot delete --cert-name "$STG_DOMAIN" --non-interactive >/dev/null 2>&1 || true
+    db "DELETE FROM staging WHERE site_id=${SID}"
+    log_activity staging_deleted "{}" "$SID"
+    ok '{}' "Staging environment deleted"
+    ;;
+
+pull)
+    [[ -n "$(stg_row)" ]] || fail "No staging environment for ${DOMAIN}"
+    db "UPDATE staging SET status='syncing' WHERE site_id=${SID}"
+    if ! sync_live_to_staging; then
+        db "UPDATE staging SET status='error' WHERE site_id=${SID}"
+        fail "Pull from live failed"
+    fi
+    db "UPDATE staging SET status='active', last_pull_at=NOW() WHERE site_id=${SID}"
+    log_activity staging_pulled "{}" "$SID"
+    ok "$(jq -cn --arg d "$STG_DOMAIN" '{staging_domain:$d}')" "Staging refreshed from live"
+    ;;
+
+push)
+    [[ -n "$(stg_row)" ]] || fail "No staging environment for ${DOMAIN}"
+    [[ -f "${STG_DOC}/wp-config.php" ]] || fail "Staging site is incomplete"
+    log "=== pushing staging -> live for ${DOMAIN}"
+    db "UPDATE staging SET status='syncing' WHERE site_id=${SID}"
+    # A push overwrites production: always snapshot live first.
+    /bin/bash /opt/flyne/scripts/backup-create.sh "$DOMAIN" full pre-staging-push >/dev/null 2>&1 \
+        || { db "UPDATE staging SET status='active' WHERE site_id=${SID}"; fail "Pre-push backup failed, push aborted"; }
+
+    LIVE_DB=$(db "SELECT db_name FROM sites WHERE id=${SID}")
+    LIVE_DBU=$(db "SELECT db_user FROM sites WHERE id=${SID}")
+    LIVE_DBP=$(db "SELECT db_pass FROM sites WHERE id=${SID}")
+
+    cp -p "${DOC_ROOT}/wp-config.php" "${TMP_DIR}/wp-config.live.$$" 2>/dev/null || true
+    if ! rsync -a --delete \
+            --exclude='wp-content/cache/' --exclude='wp-content/upgrade/' --exclude='.git/' \
+            "${STG_DOC}/" "${DOC_ROOT}/"; then
+        db "UPDATE staging SET status='error' WHERE site_id=${SID}"
+        fail "File push failed - live site restored from the pre-push backup is recommended"
+    fi
+    [[ -f "${TMP_DIR}/wp-config.live.$$" ]] && cp -p "${TMP_DIR}/wp-config.live.$$" "${DOC_ROOT}/wp-config.php"
+    rm -f "${TMP_DIR}/wp-config.live.$$"
+
+    if ! mysqldump --single-transaction --quick --routines --triggers --default-character-set=utf8mb4 \
+            "$STG_DB" 2>/dev/null | mysql "$LIVE_DB"; then
+        db "UPDATE staging SET status='error' WHERE site_id=${SID}"
+        fail "Database push failed - restore the pre-push backup"
+    fi
+    wp_run search-replace "//${STG_DOMAIN}" "//${DOMAIN}" --all-tables-with-prefix --skip-columns=guid --quiet >/dev/null 2>&1 || true
+    SCHEME=http; [[ "$SSL" == "1" ]] && SCHEME=https
+    wp_run option update home "${SCHEME}://${DOMAIN}" >/dev/null 2>&1 || true
+    wp_run option update siteurl "${SCHEME}://${DOMAIN}" >/dev/null 2>&1 || true
+    wp_run option update blog_public 1 >/dev/null 2>&1 || true
+    chown -R "$SITE_USER:$SITE_USER" "$DOC_ROOT"
+    find "$DOC_ROOT" -type d -exec chmod 2750 {} + 2>/dev/null || true
+    find "$DOC_ROOT" -type f -exec chmod 640 {} + 2>/dev/null || true
+    chmod 600 "${DOC_ROOT}/wp-config.php" 2>/dev/null || true
+    [[ -d "$CACHE_PATH" ]] && find "$CACHE_PATH" -mindepth 1 -delete 2>/dev/null || true
+    wp_run cache flush >/dev/null 2>&1 || true
+    db "UPDATE staging SET status='active', last_push_at=NOW() WHERE site_id=${SID}"
+    log_activity staging_pushed "{}" "$SID"
+    log "=== push complete for ${DOMAIN}"
+    ok "$(jq -cn --arg d "$DOMAIN" '{domain:$d, pushed:true}')" "Staging pushed to live (pre-push backup was taken)"
+    ;;
+
+info|list)
+    ROW=$(stg_row)
+    if [[ -z "$ROW" ]]; then
+        if [[ "$OP" == "list" ]]; then ok '{"stagings":[],"count":0}'; fi
+        ok "$(jq -cn --arg l "$DOMAIN" '{exists:false, has_staging:false, live_domain:$l}')"
+    fi
+    IFS=$'\t' read -r SD SDB SST SAU SPUSH SPULL SCREATED <<< "$ROW"
+    USED=0; [[ -d "$STG_DIR" ]] && USED=$(dir_size_mb "$STG_DIR")
+    DATA=$(jq -cn --arg d "$SD" --arg st "$SST" --arg au "$SAU" --arg l "$DOMAIN" \
+        --arg pu "$SPUSH" --arg pl "$SPULL" --arg cr "$SCREATED" --argjson u "$USED" \
+        '{exists:true, has_staging:true, live_domain:$l, staging_domain:$d,
+          staging_url:("https://"+$d), staging_admin:("https://"+$d+"/wp-admin/"),
+          status:$st, auth_user:$au, disk_usage:$u, disk_usage_mb:$u,
+          last_push_at:(if $pu=="" then null else $pu end),
+          last_pull_at:(if $pl=="" then null else $pl end),
+          created_at:(if $cr=="" then null else $cr end)}')
+    if [[ "$OP" == "list" ]]; then
+        ok "$(jq -cn --argjson d "$DATA" '{stagings:[$d], count:1}')"
+    fi
+    ok "$DATA"
+    ;;
+
+*) fail "Unknown staging operation: ${OP}" ;;
+esac
+SCRIPT
+
+# ==================== WEB TERMINAL / FILE BROWSER ====================
+# Everything runs as the site's own Linux user, confined to that site's tree.
+# Note this grants no privilege the customer does not already have through SFTP
+# or by uploading PHP; the real boundary is the per-site user + cgroup limits.
+# The binary allowlist exists to stop accidents and obvious abuse, and to make
+# privilege-escalation attempts (sudo, su, systemctl) impossible to even type.
+cat > "${FLYNE_DIR}/scripts/terminal.sh" << 'SCRIPT'
+#!/bin/bash
+# terminal.sh <domain> exec <cwd> <argv...> | wpcli <cwd> <argv...> | files <path> | read <path> | history
+source /opt/flyne/scripts/lib.sh
+load_site "${1:-}"
+OP="${2:-}"
+SID=$(site_id)
+[[ "$SUSPENDED" == "1" ]] && fail "Site is suspended"
+
+ALLOWED_BINS="ls cat head tail pwd echo printf wc grep egrep fgrep find du df stat file
+mkdir rmdir rm cp mv touch chmod unzip zip tar gzip gunzip zcat sed awk sort uniq cut tr
+diff curl wget git composer php wp node npm npx yarn date whoami id env free uptime
+basename dirname realpath readlink md5sum sha256sum which true false sleep rsync tree ln"
+
+# Resolve a user-supplied path and refuse anything outside this site's tree.
+safe_path() {
+    local p="${1:-}" base="${2:-$DOC_ROOT}" real
+    [[ -z "$p" || "$p" == "~" ]] && p="$base"
+    [[ "$p" != /* ]] && p="${base}/${p}"
+    real=$(realpath -m -- "$p" 2>/dev/null) || return 1
+    [[ "$real" == "$SITE_DIR" || "$real" == "$SITE_DIR"/* ]] || return 1
+    printf '%s' "$real"
+}
+
+run_as_site() {   # run_as_site <cwd> <argv...>
+    local cwd="$1"; shift
+    runuser -u "$SITE_USER" -- env -i -C "$cwd" \
+        HOME="$SITE_DIR" PATH=/usr/local/bin:/usr/bin:/bin TMPDIR="$TMP_DIR" \
+        LC_ALL=C.UTF-8 LANG=C.UTF-8 TERM=dumb COLUMNS=120 \
+        WP_CLI_CACHE_DIR="${TMP_DIR}/wp-cli-cache" WP_CLI_DISABLE_AUTO_CHECK_UPDATE=1 \
+        timeout 60 "$@" 2>&1
+}
+
+case "$OP" in
+
+exec)
+    CWD_IN="${3:-}"; shift 3 || true
+    [[ $# -ge 1 ]] || fail "Command required"
+    CWD=$(safe_path "$CWD_IN") || fail "Path is outside this site"
+    [[ -d "$CWD" ]] || fail "Directory does not exist"
+    BIN="$1"
+    [[ "$BIN" =~ ^[a-zA-Z0-9_.-]+$ ]] || fail "Invalid command name"
+    [[ " $(echo $ALLOWED_BINS) " == *" $BIN "* ]] || fail "Command not permitted: ${BIN}"
+    for a in "$@"; do
+        case "$a" in
+            -exec|-execdir|-ok|-okdir) fail "The ${a} option is not permitted" ;;
+        esac
+    done
+    RC=0
+    OUT=$(run_as_site "$CWD" "$@") || RC=$?
+    OUT=$(printf '%s' "$OUT" | head -c 262144)
+    db "INSERT INTO terminal_history (site_id, command, exit_code, cwd)
+        VALUES (${SID}, '$(sql_esc "$(printf '%s ' "$@" | head -c 1900)")', ${RC}, '$(sql_esc "$CWD")')" || true
+    db "DELETE FROM terminal_history WHERE site_id=${SID} AND id NOT IN
+        (SELECT id FROM (SELECT id FROM terminal_history WHERE site_id=${SID} ORDER BY id DESC LIMIT 200) x)" || true
+    ok "$(jq -cn --arg o "$OUT" --argjson rc "$RC" --arg c "${CWD#$SITE_DIR}" \
+        '{output:$o, exit_code:$rc, cwd:(if $c=="" then "/" else $c end)}')"
+    ;;
+
+wpcli)
+    CWD_IN="${3:-}"; shift 3 || true
+    [[ $# -ge 1 ]] || fail "WP-CLI command required"
+    case "$1" in eval|eval-file|shell|package|cli|server|-*) fail "WP-CLI command '$1' is not permitted" ;; esac
+    RC=0
+    OUT=$(wp_run "$@" 2>&1) || RC=$?
+    OUT=$(printf '%s' "$OUT" | head -c 262144)
+    db "INSERT INTO terminal_history (site_id, command, exit_code, cwd)
+        VALUES (${SID}, '$(sql_esc "wp $(printf '%s ' "$@" | head -c 1890)")', ${RC}, '/public')" || true
+    ok "$(jq -cn --arg o "$OUT" --argjson rc "$RC" '{output:$o, exit_code:$rc}')"
+    ;;
+
+files)
+    DIR=$(safe_path "${3:-}") || fail "Path is outside this site"
+    [[ -d "$DIR" ]] || fail "Not a directory"
+    ITEMS=$(runuser -u "$SITE_USER" -- find "$DIR" -maxdepth 1 -mindepth 1 \
+        -printf '%y\t%s\t%TY-%Tm-%TdT%TH:%TM:%TSZ\t%m\t%f\n' 2>/dev/null | sort -t$'\t' -k1,1r -k5,5 || true)
+    ok "$(printf '%s\n' "$ITEMS" | jq -Rn --arg p "${DIR#$SITE_DIR}" '
+        {path: (if $p=="" then "/" else $p end),
+         items: [inputs | select(length>0) | split("\t")
+                 | {type: (if .[0]=="d" then "dir" elif .[0]=="l" then "link" else "file" end),
+                    size: (.[1]|tonumber), modified: .[2], mode: .[3], name: .[4]}]}')"
+    ;;
+
+read)
+    F=$(safe_path "${3:-}") || fail "Path is outside this site"
+    [[ -f "$F" ]] || fail "Not a file"
+    SZ=$(stat -c%s "$F")
+    (( SZ > 1048576 )) && fail "File is larger than 1 MB - use SFTP to download it"
+    runuser -u "$SITE_USER" -- test -r "$F" || fail "Permission denied"
+    CONTENT=$(runuser -u "$SITE_USER" -- head -c 1048576 -- "$F" 2>/dev/null || true)
+    ok "$(jq -cn --arg c "$CONTENT" --arg n "$(basename "$F")" --arg p "${F#$SITE_DIR}" --argjson s "$SZ" \
+        '{content:$c, name:$n, path:$p, size:$s}')"
+    ;;
+
+history)
+    ROWS=$(db "SELECT JSON_ARRAYAGG(JSON_OBJECT('command',command,'exit_code',exit_code,'cwd',cwd,
+            'at',DATE_FORMAT(created_at,'%Y-%m-%dT%H:%i:%sZ')))
+            FROM (SELECT * FROM terminal_history WHERE site_id=${SID} ORDER BY id DESC LIMIT 100) h")
+    [[ -z "$ROWS" || "$ROWS" == "NULL" ]] && ROWS="[]"
+    ok "$(jq -cn --argjson h "$ROWS" '{history:$h}')"
+    ;;
+
+*) fail "Unknown terminal operation" ;;
+esac
+SCRIPT
+
 chown -R root:root "${FLYNE_DIR}/scripts"
 chmod 750 "${FLYNE_DIR}/scripts"/*.sh
 chmod 640 "${FLYNE_DIR}/scripts/lib.sh"
@@ -2947,6 +3640,8 @@ MAILTO=""
 25 * * * *  root /opt/flyne/scripts/quota-check.sh >> /var/log/flyne/cron.log 2>&1
 # temporary SFTP access expiry
 */5 * * * * root /opt/flyne/scripts/sftp-expire.sh >> /var/log/flyne/cron.log 2>&1
+# expired one-time download links and their files
+7 * * * *   root find /var/lib/flyne/exports -type f -mmin +120 -delete 2>/dev/null; mysql -N -e "DELETE FROM flyne_engine.download_tokens WHERE expires_at < NOW()" 2>/dev/null
 CRONFILE
 chmod 644 /etc/cron.d/flyne
 
