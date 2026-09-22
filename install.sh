@@ -2611,9 +2611,19 @@ render_one() {   # render_one <domain> <root> <socket> <kind>
     include snippets/flyne-acme.conf;
 ${ALLOW}    location = /index.php {
         limit_req zone=flyne_api burst=60 nodelay;
-        include snippets/flyne-php.conf;
+        # NOT including snippets/flyne-php.conf here: the API needs 900s timeouts for
+        # create-site, and nginx rejects a directive set twice in the same context.
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTP_PROXY \"\";
+        fastcgi_index index.php;
+        fastcgi_intercept_errors off;
+        fastcgi_connect_timeout 10s;
         fastcgi_read_timeout 900s;
         fastcgi_send_timeout 900s;
+        fastcgi_buffer_size 64k;
+        fastcgi_buffers 32 32k;
+        fastcgi_busy_buffers_size 128k;
         fastcgi_pass unix:${sock};
     }
     location / { rewrite ^ /index.php last; }"
@@ -2657,11 +2667,19 @@ if [[ "${PMA_ENABLED:-0}" == "1" && -n "${PMA_DOMAIN:-}" ]]; then
 else
     rm -f "${NGX_SITES}/002-pma.conf"
 fi
-nginx -t || fail "nginx rejected the panel vhost"
+if ! NGX_ERR=$(nginx -t 2>&1); then
+    log "nginx rejected the panel vhost:"
+    log "$NGX_ERR"
+    fail "nginx rejected the panel vhost: $(tr '\n' ' ' <<< "$NGX_ERR" | head -c 400)"
+fi
 systemctl reload nginx
 # tell the API whether it may insist on TLS
-TLS=false; [[ -s "/etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem" ]] && TLS=true
+TLS=false
+if [[ -s "/etc/letsencrypt/live/${PANEL_DOMAIN}/fullchain.pem" ]]; then TLS=true; fi
 sed -i "s/'require_tls'\s*=>\s*\(true\|false\)/'require_tls'  => ${TLS}/" /etc/flyne/api/config.php
+# sed -i can replace the inode; re-assert ownership so the API can still read its config
+chown root:flyne-api /etc/flyne/api/config.php
+chmod 640 /etc/flyne/api/config.php
 ok "$(jq -cn --argjson t "$TLS" '{panel_tls:$t}')" "Panel vhosts rendered"
 SCRIPT
 
@@ -3078,7 +3096,14 @@ if [[ -n "$API_ALLOWED_IPS" ]]; then
     tr ',' '\n' <<< "${API_ALLOWED_IPS// /}" | grep -v '^$' > /etc/flyne/api/allowed-ips
     chmod 644 /etc/flyne/api/allowed-ips
 fi
-/bin/bash "${FLYNE_DIR}/scripts/render-panel.sh" >/dev/null || error "Panel vhost rendering failed"
+if ! /bin/bash "${FLYNE_DIR}/scripts/render-panel.sh" >/dev/null; then
+    warn "render-panel.sh failed. Last 30 lines of ${LOG_DIR}/agent.log:"
+    tail -n 30 "${LOG_DIR}/agent.log" || true
+    echo ""
+    warn "Generated panel vhosts (for reference):"
+    ls -l /etc/nginx/flyne-sites/ || true
+    error "Panel vhost rendering failed"
+fi
 
 PANEL_NAMES=(-d "$PANEL_DOMAIN")
 PANEL_DNS=$(dig +short +time=3 +tries=1 A "$PANEL_DOMAIN" 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
