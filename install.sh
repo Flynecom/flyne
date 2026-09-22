@@ -856,7 +856,8 @@ http {
     fastcgi_cache_key "$request_method$host$request_uri";
     fastcgi_cache_lock on;
     fastcgi_cache_lock_timeout 5s;
-    fastcgi_cache_use_stale error timeout updating invalid_header http_500 http_502 http_503 http_504;
+    # note: the fastcgi module accepts only these; http_502/http_504 are proxy_cache_use_stale only
+    fastcgi_cache_use_stale error timeout updating invalid_header http_500 http_503 http_403 http_404 http_429;
     fastcgi_cache_background_update on;
     fastcgi_cache_methods GET HEAD;
     fastcgi_ignore_headers Cache-Control Expires;
@@ -2585,6 +2586,7 @@ while IFS=$'\t' read -r d quota; do
 done < <(db "SELECT domain, disk_quota_mb FROM sites WHERE status='active'")
 ok "$(jq -cn --argjson c "$CHECKED" --argjson o "$OVER" '{checked:$c, over_quota:$o}')"
 SCRIPT
+
 
 # ==================== PANEL VHOST RENDER (API + phpMyAdmin) ====================
 cat > "${FLYNE_DIR}/scripts/render-panel.sh" << 'SCRIPT'
